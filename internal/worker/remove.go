@@ -31,6 +31,8 @@ func (o *Orchestrator) runRemover(ctx context.Context) error {
 func (o *Orchestrator) processRemoveJob(ctx context.Context, job *store.Job) error {
 	o.log.Info("removing local job payloads", "job_id", job.ID, "public_id", job.PublicID, "remote_id", deref(job.RemoteID))
 
+	upstreamDeleted := false
+
 	if o.cfg.UpstreamRemove && job.RemoteID != nil && *job.RemoteID != "" {
 		sourceType := "torrent"
 		if job.SourceType != "" {
@@ -44,6 +46,8 @@ func (o *Orchestrator) processRemoveJob(ctx context.Context, job *store.Job) err
 				return err
 			}
 			o.log.Warn("upstream delete failed, proceeding with local cleanup", "job_id", job.ID, "remote_id", *job.RemoteID, "error", err)
+		} else {
+			upstreamDeleted = true
 		}
 	}
 
@@ -78,6 +82,10 @@ func (o *Orchestrator) processRemoveJob(ctx context.Context, job *store.Job) err
 	job.ErrorMessage = nil
 	job.NextRunAt = nil
 	job.UpdatedAt = time.Now().UTC()
+	if upstreamDeleted {
+		o.log.Info("job removed; upstream torbox task deleted", "job_id", job.ID, "public_id", job.PublicID, "remote_id", deref(job.RemoteID))
+		return o.store.UpdateJobState(ctx, job, store.StateRemoved, "local payload removed; upstream torbox task deleted")
+	}
 	o.log.Info("job removed locally; torbox content retained", "job_id", job.ID, "public_id", job.PublicID, "remote_id", deref(job.RemoteID))
 	return o.store.UpdateJobState(ctx, job, store.StateRemoved, "local payload removed; torbox content retained")
 }
