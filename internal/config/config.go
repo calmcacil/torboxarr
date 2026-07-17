@@ -19,6 +19,8 @@ const (
 )
 
 type Config struct {
+	UpstreamRemove bool
+
 	Server struct {
 		Address string
 		BaseURL string
@@ -167,6 +169,13 @@ func applyEnv(cfg *Config) {
 	setString(&cfg.Auth.QBitPassword, "TORBOXARR_QBIT_PASSWORD")
 	setString(&cfg.Auth.SABAPIKey, "TORBOXARR_SAB_API_KEY")
 	setString(&cfg.Auth.SABNZBKey, "TORBOXARR_SAB_NZB_KEY")
+
+	if v := strings.TrimSpace(os.Getenv("TORBOXARR_UPSTREAM_REMOVE")); v != "" {
+		parsed, err := strconv.ParseBool(v)
+		if err == nil {
+			cfg.UpstreamRemove = parsed
+		}
+	}
 }
 
 func (c *Config) Validate() error {

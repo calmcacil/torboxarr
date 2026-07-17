@@ -2,11 +2,13 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"time"
 
 	"github.com/mrjoiny/torboxarr/internal/store"
+	"github.com/mrjoiny/torboxarr/internal/torbox"
 )
 
 func (o *Orchestrator) runRemover(ctx context.Context) error {
@@ -28,6 +30,23 @@ func (o *Orchestrator) runRemover(ctx context.Context) error {
 
 func (o *Orchestrator) processRemoveJob(ctx context.Context, job *store.Job) error {
 	o.log.Info("removing local job payloads", "job_id", job.ID, "public_id", job.PublicID, "remote_id", deref(job.RemoteID))
+
+	if o.cfg.UpstreamRemove && job.RemoteID != nil && *job.RemoteID != "" {
+		sourceType := "torrent"
+		if job.SourceType != "" {
+			sourceType = string(job.SourceType)
+		}
+		o.log.Info("deleting upstream torbox task", "job_id", job.ID, "remote_id", *job.RemoteID, "source_type", sourceType)
+		if err := o.torbox.DeleteTask(ctx, sourceType, *job.RemoteID); err != nil {
+			var retryable *torbox.RetryableError
+			if errors.As(err, &retryable) {
+				o.log.Warn("upstream delete temporarily failed, will retry", "job_id", job.ID, "remote_id", *job.RemoteID, "error", err)
+				return err
+			}
+			o.log.Warn("upstream delete failed, proceeding with local cleanup", "job_id", job.ID, "remote_id", *job.RemoteID, "error", err)
+		}
+	}
+
 	if job.CompletedPath != nil {
 		if err := ensurePathWithinRoot(o.layout.Completed, *job.CompletedPath); err != nil {
 			return o.failUnsafeRemoval(ctx, job, "completed path", *job.CompletedPath, err)

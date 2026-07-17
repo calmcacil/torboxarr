@@ -233,6 +233,27 @@ func (c *HTTPClient) getQueuedItems(ctx context.Context, sourceType string, queu
 	return parseItemsEnvelope(env)
 }
 
+func (c *HTTPClient) DeleteTask(ctx context.Context, sourceType string, remoteID string) error {
+	switch strings.ToLower(sourceType) {
+	case "torrent":
+		body := fmt.Sprintf(`{"operation":"delete","torrent_id":%s}`, remoteID)
+		_, err := c.do(ctx, http.MethodPost, "/api/torrents/controltorrent", strings.NewReader(body), "application/json", true)
+		if err != nil {
+			return fmt.Errorf("delete torrent: %w", err)
+		}
+		return nil
+	case "nzb", "usenet":
+		body := fmt.Sprintf(`{"operation":"delete","usenet_id":%s}`, remoteID)
+		_, err := c.do(ctx, http.MethodPost, "/api/usenet/controlusenetdownload", strings.NewReader(body), "application/json", true)
+		if err != nil {
+			return fmt.Errorf("delete usenet: %w", err)
+		}
+		return nil
+	default:
+		return fmt.Errorf("unknown source type for upstream delete: %q", sourceType)
+	}
+}
+
 func attachFile(writer *multipart.Writer, field, path string) error {
 	file, err := os.Open(path)
 	if err != nil {
