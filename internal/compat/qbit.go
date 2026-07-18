@@ -50,6 +50,8 @@ type QBitTorrentInfo struct {
 	Priority     int     `json:"priority"`
 	Progress     float64 `json:"progress"`
 	Ratio        float64 `json:"ratio"`
+	RatioLimit   float64 `json:"ratio_limit"`
+	SeedingTime  int64   `json:"seeding_time"`
 	SavePath     string  `json:"save_path"`
 	Size         int64   `json:"size"`
 	State        string  `json:"state"`
@@ -120,6 +122,8 @@ func ProjectQBitTorrent(job *store.Job) QBitTorrentInfo {
 		Priority:     0,
 		Progress:     progress,
 		Ratio:        0,
+		RatioLimit:   0,
+		SeedingTime:  0,
 		SavePath:     savePath,
 		Size:         max(total, done),
 		State:        state,
