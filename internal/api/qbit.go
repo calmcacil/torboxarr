@@ -1,6 +1,7 @@
 package api
 
 import (
+	"mime"
 	"net/http"
 	"net/url"
 	"os"
@@ -114,7 +115,8 @@ func (s *Server) handleQBitTransferInfo(w http.ResponseWriter, r *http.Request) 
 
 func (s *Server) handleQBitAdd(w http.ResponseWriter, r *http.Request) {
 	contentType := r.Header.Get("Content-Type")
-	if strings.HasPrefix(contentType, "multipart/form-data") {
+	mediaType, _, _ := mime.ParseMediaType(contentType)
+	if mediaType == "multipart/form-data" {
 		if err := r.ParseMultipartForm(8 << 20); err != nil { // 8 MB; torrent files are typically < 1 MB
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
