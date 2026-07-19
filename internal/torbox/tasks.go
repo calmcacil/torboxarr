@@ -234,16 +234,20 @@ func (c *HTTPClient) getQueuedItems(ctx context.Context, sourceType string, queu
 }
 
 func (c *HTTPClient) DeleteTask(ctx context.Context, sourceType string, remoteID string) error {
+	id, err := strconv.ParseInt(strings.TrimSpace(remoteID), 10, 64)
+	if err != nil {
+		return fmt.Errorf("upstream delete: remote id %q is not a numeric TorBox task id: %w", remoteID, err)
+	}
 	switch strings.ToLower(sourceType) {
 	case "torrent":
-		body := fmt.Sprintf(`{"operation":"delete","torrent_id":%s}`, remoteID)
+		body := fmt.Sprintf(`{"operation":"delete","torrent_id":%d}`, id)
 		_, err := c.do(ctx, http.MethodPost, "/api/torrents/controltorrent", strings.NewReader(body), "application/json", true)
 		if err != nil {
 			return fmt.Errorf("delete torrent: %w", err)
 		}
 		return nil
 	case "nzb", "usenet":
-		body := fmt.Sprintf(`{"operation":"delete","usenet_id":%s}`, remoteID)
+		body := fmt.Sprintf(`{"operation":"delete","usenet_id":%d}`, id)
 		_, err := c.do(ctx, http.MethodPost, "/api/usenet/controlusenetdownload", strings.NewReader(body), "application/json", true)
 		if err != nil {
 			return fmt.Errorf("delete usenet: %w", err)
