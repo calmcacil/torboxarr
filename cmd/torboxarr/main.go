@@ -23,6 +23,13 @@ import (
 var version = "dev"
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "add" {
+		if err := runAddCommand(context.Background(), os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "add:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
