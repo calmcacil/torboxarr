@@ -304,6 +304,59 @@ func TestProcessRemoveJob_UpstreamFailureStillCleansLocally(t *testing.T) {
 	}
 }
 
+func TestProcessRemoveJob_UpstreamDeleteRetriesThenEscalates(t *testing.T) {
+	env := newRemoveTestEnv(t)
+	env.orch.cfg.UpstreamRemove = true
+
+	var deleteCalls int
+	env.mock.DeleteTaskFn = func(_ context.Context, _, _ string) error {
+		deleteCalls++
+		return torbox.MarkRetryable(errors.New("torbox 500 DATABASE_ERROR"))
+	}
+
+	env.insertRemovePendingJob(t, "r1", "57356712", store.SourceTypeTorrent)
+
+	ctx := context.Background()
+	// Simulate the remover ticking repeatedly while the upstream API is down.
+	// Attempts 1-4 must return an error (retry); attempt 5 must escalate and
+	// proceed with local cleanup, transitioning the job to StateRemoved.
+	for attempt := 1; attempt <= maxUpstreamDeleteAttempts; attempt++ {
+		job, err := env.store.GetJobByID(ctx, "r1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = env.orch.processRemoveJob(ctx, job)
+		switch {
+		case attempt < maxUpstreamDeleteAttempts:
+			if err == nil {
+				t.Fatalf("attempt %d: expected retryable error, got nil", attempt)
+			}
+		default:
+			if err != nil {
+				t.Fatalf("attempt %d: expected escalation (no error), got %v", attempt, err)
+			}
+		}
+	}
+
+	if deleteCalls != maxUpstreamDeleteAttempts {
+		t.Errorf("expected %d delete calls, got %d", maxUpstreamDeleteAttempts, deleteCalls)
+	}
+
+	got, err := env.store.GetJobByID(ctx, "r1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != store.StateRemoved {
+		t.Errorf("after max attempts the job must finalize locally; state=%s", got.State)
+	}
+	if got.Metadata.UpstreamDeleteAttempts != maxUpstreamDeleteAttempts {
+		t.Errorf("expected UpstreamDeleteAttempts=%d, got %d", maxUpstreamDeleteAttempts, got.Metadata.UpstreamDeleteAttempts)
+	}
+	if _, err := os.Stat(filepath.Join(env.dir, "completed", "r1", "file.mkv")); !os.IsNotExist(err) {
+		t.Error("completed file should have been removed locally after escalation")
+	}
+}
+
 func TestProcessRemoveJob_QueuedJobNoRemoteIDSkipsUpstream(t *testing.T) {
 	env := newRemoveTestEnv(t)
 	env.orch.cfg.UpstreamRemove = true

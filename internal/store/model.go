@@ -56,6 +56,11 @@ type SubmissionMetadata struct {
 	AddOnlyIfCached  bool     `json:"add_only_if_cached,omitempty"`
 	UploadedFilename string   `json:"uploaded_filename,omitempty"`
 	OriginalFilename string   `json:"original_filename,omitempty"`
+
+	// UpstreamDeleteAttempts tracks how many times the upstream TorBox delete
+	// has been attempted (and failed retryably) for this job. Used to cap
+	// retries so a prolonged TorBox outage doesn't wedge the job forever.
+	UpstreamDeleteAttempts int `json:"upstream_delete_attempts,omitempty"`
 }
 
 type Job struct {
