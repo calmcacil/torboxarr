@@ -4,13 +4,6 @@ Pretends to be qBittorrent or SABnzbd so your *arr apps can use [TorBox](https:/
 
 When Sonarr or Radarr sends a torrent or NZB, TorBoxarr accepts it through the standard qBittorrent/SABnzbd API, submits it to TorBox, polls until the remote download finishes, pulls the files down locally, and places them where the *arr app expects to find them.
 
-## Support
-
-If TorBoxarr has been useful to you and you want to support the project, you can use my TorBox referral when you subscribe:
-
-- Referral code: `605c7a7b-6913-4ec3-868c-061aa6694f43`
-- Referral link: [torbox.app/subscription?referral=605c7a7b-6913-4ec3-868c-061aa6694f43](https://torbox.app/subscription?referral=605c7a7b-6913-4ec3-868c-061aa6694f43)
-
 ## How it works
 
 TorBoxarr runs a single Go binary with an HTTP server and a set of background workers. The server handles two API surfaces:
