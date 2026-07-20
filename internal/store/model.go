@@ -61,6 +61,11 @@ type SubmissionMetadata struct {
 	// has been attempted (and failed retryably) for this job. Used to cap
 	// retries so a prolonged TorBox outage doesn't wedge the job forever.
 	UpstreamDeleteAttempts int `json:"upstream_delete_attempts,omitempty"`
+
+	// PollAttempts tracks how many consecutive retryable poll failures this job
+	// has seen. Used to cap retries so a job whose upstream task no longer
+	// exists (or a sustained TorBox outage) doesn't poll forever.
+	PollAttempts int `json:"poll_attempts,omitempty"`
 }
 
 type Job struct {

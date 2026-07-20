@@ -107,6 +107,29 @@ func IsRetryable(err error) bool {
 	return errors.As(err, &retryable)
 }
 
+// ErrTorboxLogical indicates the TorBox API returned a structured error in its
+// response body (typically `{"success":false,"error":"DATABASE_ERROR",...}` on a
+// 500). This most often means the requested task does not exist or is otherwise
+// unrecoverable upstream — but TorBox returns the same shape during a transient
+// backend outage, so callers must NOT treat it as immediately fatal. It is used
+// to distinguish a logical failure from a transport-level retryable error.
+type ErrTorboxLogical struct {
+	Err error
+}
+
+func (e *ErrTorboxLogical) Error() string {
+	return e.Err.Error()
+}
+
+func (e *ErrTorboxLogical) Unwrap() error {
+	return e.Err
+}
+
+func IsTorboxLogical(err error) bool {
+	var logical *ErrTorboxLogical
+	return errors.As(err, &logical)
+}
+
 func RequireRemoteID(remoteID string) error {
 	if remoteID == "" {
 		return fmt.Errorf("remote id is required")

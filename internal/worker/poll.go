@@ -9,6 +9,12 @@ import (
 	"github.com/mrjoiny/torboxarr/internal/torbox"
 )
 
+// maxPollAttempts caps how many consecutive failed polls TorBoxarr allows
+// before concluding the upstream task is unrecoverable (missing or TorBox
+// unavailable) and moving the job to remote_failed. This prevents a single
+// orphaned/invalid remote_id from polling forever.
+const maxPollAttempts = 5
+
 func (o *Orchestrator) runPoller(ctx context.Context) error {
 	jobs, err := o.store.ClaimJobsDue(ctx, "poller", []store.JobState{store.StateRemoteQueued, store.StateRemoteActive}, time.Now().UTC(), o.cfg.Workers.BatchSize)
 	if err != nil {
@@ -34,17 +40,33 @@ func (o *Orchestrator) processPollJob(ctx context.Context, job *store.Job) error
 	o.log.Debug("polling remote job", "job_id", job.ID, "public_id", job.PublicID, "remote_id", deref(job.RemoteID))
 	status, err := o.torbox.GetTaskStatus(ctx, string(job.SourceType), deref(job.RemoteID))
 	if err != nil {
-		if torbox.IsRetryable(err) {
-			nextRun := time.Now().UTC().Add(withJitter(o.cfg.Workers.PollInterval))
-			job.NextRunAt = &nextRun
+		// Retryable (transport) and logical (TorBox returned success:false, e.g.
+		// task not found / unrecoverable) failures both count toward the cap. A
+		// missing upstream task and a transient TorBox outage are indistinguishable
+		// at the API level, so we retry a few times before concluding the task is
+		// unrecoverable and moving on.
+		if torbox.IsRetryable(err) || torbox.IsTorboxLogical(err) {
+			job.Metadata.PollAttempts++
+			if job.Metadata.PollAttempts < maxPollAttempts {
+				nextRun := time.Now().UTC().Add(withJitter(o.cfg.Workers.PollInterval))
+				job.NextRunAt = &nextRun
+				job.UpdatedAt = time.Now().UTC()
+				o.log.Warn("poll failed, will retry",
+					"job_id", job.ID,
+					"public_id", job.PublicID,
+					"attempt", job.Metadata.PollAttempts,
+					"next_run_at", nextRun.Format(time.RFC3339Nano),
+					"error", err.Error(),
+				)
+				return o.store.UpdateJob(ctx, job)
+			}
+			msg := "poll failed after max attempts; upstream task unrecoverable (not found or TorBox unavailable)"
+			job.ErrorMessage = &msg
+			job.NextRunAt = nil
 			job.UpdatedAt = time.Now().UTC()
-			o.log.Warn("poll failed, will retry",
-				"job_id", job.ID,
-				"public_id", job.PublicID,
-				"next_run_at", nextRun.Format(time.RFC3339Nano),
-				"error", err.Error(),
-			)
-			return o.store.UpdateJob(ctx, job)
+			o.log.Error("poll failed permanently", "job_id", job.ID, "public_id", job.PublicID,
+				"attempts", job.Metadata.PollAttempts, "error", err.Error())
+			return o.store.UpdateJobState(ctx, job, store.StateRemoteFailed, msg)
 		}
 		msg := err.Error()
 		job.ErrorMessage = &msg

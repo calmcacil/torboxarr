@@ -85,6 +85,15 @@ func (c *HTTPClient) do(ctx context.Context, method, path string, body io.Reader
 	)
 
 	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+		// TorBox frequently returns 500 with a structured error body
+		// (e.g. {"success":false,"error":"DATABASE_ERROR",...}) for a task that
+		// does not exist or is otherwise unrecoverable. Surface that as a
+		// logical error so callers can distinguish it from a transport-level
+		// failure, but it is still subject to retry/escalation caps.
+		var env apiEnvelope
+		if len(bytes.TrimSpace(raw)) > 0 && json.Unmarshal(raw, &env) == nil && !env.Success {
+			return nil, &ErrTorboxLogical{Err: fmt.Errorf("torbox status %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))}
+		}
 		return nil, MarkRetryable(fmt.Errorf("torbox status %d: %s", resp.StatusCode, strings.TrimSpace(string(raw))))
 	}
 	if resp.StatusCode >= 400 {
