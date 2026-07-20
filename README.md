@@ -69,6 +69,7 @@ Optional overrides:
 | `TORBOXARR_DATABASE_PATH` | `/config/torboxarr.db` | SQLite database path; the container stores state under `/config` |
 | `TORBOXARR_LOG_LEVEL` | `INFO` | Log verbosity: DEBUG, INFO, WARN, or ERROR |
 | `TORBOXARR_SAB_NZB_KEY` | falls back to `TORBOXARR_SAB_API_KEY` | Explicit key for the SABnzbd-compatible endpoint; omit it to reuse the SAB API key |
+| `TORBOXARR_UPSTREAM_REMOVE` | `false` | When true, removing a download also deletes the matching task from TorBox's servers, so cached entries don't accumulate there |
 
 Docker-specific runtime variables used by the bundled compose file. Set these to the same UID/GID that Sonarr and Radarr use on the host, so TorBoxarr can write to the same download and category folders:
 
@@ -76,6 +77,12 @@ Docker-specific runtime variables used by the bundled compose file. Set these to
 |---|---|---|
 | `PUID` | none | UID the container drops to before starting TorBoxarr; required for the bundled Docker setup |
 | `PGID` | none | GID the container drops to before starting TorBoxarr; required for the bundled Docker setup |
+
+#### Removing downloads from TorBox
+
+By default TorBoxarr only deletes the local copy when a download is removed; the entry stays in your TorBox account. Set `TORBOXARR_UPSTREAM_REMOVE=true` to also delete the matching task from TorBox when a job is removed. This keeps your TorBox cache from filling up with entries that the *arr apps have already imported and discarded.
+
+The upstream delete happens as part of the local removal: if it fails (for example, a transient TorBox API error) TorBoxarr logs a warning and still cleans up the local files, so a stuck remote entry never blocks local cleanup. Check the logs for `upstream torbox task deleted` to confirm the remote entry was removed, or `torbox content retained` if it was skipped or failed.
 
 ### Connecting Sonarr/Radarr / Download Clients
 
