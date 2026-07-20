@@ -28,6 +28,12 @@ func (o *Orchestrator) runRemover(ctx context.Context) error {
 	return nil
 }
 
+// maxUpstreamDeleteAttempts caps how many times TorBoxarr retries an upstream
+// TorBox delete before giving up and proceeding with local cleanup only. This
+// prevents a prolonged TorBox API outage from wedging a job in remove_pending
+// indefinitely.
+const maxUpstreamDeleteAttempts = 5
+
 func (o *Orchestrator) processRemoveJob(ctx context.Context, job *store.Job) error {
 	o.log.Info("removing local job payloads", "job_id", job.ID, "public_id", job.PublicID, "remote_id", deref(job.RemoteID))
 
@@ -42,10 +48,24 @@ func (o *Orchestrator) processRemoveJob(ctx context.Context, job *store.Job) err
 		if err := o.torbox.DeleteTask(ctx, sourceType, *job.RemoteID); err != nil {
 			var retryable *torbox.RetryableError
 			if errors.As(err, &retryable) {
-				o.log.Warn("upstream delete temporarily failed, will retry", "job_id", job.ID, "remote_id", *job.RemoteID, "error", err)
-				return err
+				job.Metadata.UpstreamDeleteAttempts++
+				if job.Metadata.UpstreamDeleteAttempts >= maxUpstreamDeleteAttempts {
+					o.log.Warn("upstream delete failed after max attempts, proceeding with local cleanup",
+						"job_id", job.ID, "remote_id", *job.RemoteID,
+						"attempts", job.Metadata.UpstreamDeleteAttempts, "error", err)
+				} else {
+					o.log.Warn("upstream delete temporarily failed, will retry",
+						"job_id", job.ID, "remote_id", *job.RemoteID,
+						"attempt", job.Metadata.UpstreamDeleteAttempts, "error", err)
+					job.UpdatedAt = time.Now().UTC()
+					if uerr := o.store.UpdateJob(ctx, job); uerr != nil {
+						o.log.Error("failed to persist upstream delete attempt count", "job_id", job.ID, "error", uerr)
+					}
+					return err
+				}
+			} else {
+				o.log.Warn("upstream delete failed, proceeding with local cleanup", "job_id", job.ID, "remote_id", *job.RemoteID, "error", err)
 			}
-			o.log.Warn("upstream delete failed, proceeding with local cleanup", "job_id", job.ID, "remote_id", *job.RemoteID, "error", err)
 		} else {
 			upstreamDeleted = true
 		}
