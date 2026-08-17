@@ -104,6 +104,7 @@ func (o *Orchestrator) processQueuedPollJob(ctx context.Context, job *store.Job)
 		)
 		return o.tryRecoverActiveStatus(ctx, job)
 	}
+	job.Metadata.PollAttempts = 0
 
 	if queuedStatus.QueueAuthID != "" {
 		job.QueueAuthID = ptr(queuedStatus.QueueAuthID)
@@ -205,6 +206,7 @@ func (o *Orchestrator) applyActiveStatus(ctx context.Context, job *store.Job, st
 		job.UpdatedAt = time.Now().UTC()
 		return o.store.UpdateJob(ctx, job)
 	}
+	job.Metadata.PollAttempts = 0
 	if status.Name != "" {
 		job.DisplayName = status.Name
 	}
