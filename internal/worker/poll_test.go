@@ -92,15 +92,15 @@ func TestProcessPollJob_LogicalErrorEscalatesAfterMaxAttempts(t *testing.T) {
 	}
 
 	job := &store.Job{
-		ID:            "ghost-001",
-		PublicID:      "pub-ghost-001",
-		SourceType:    store.SourceTypeTorrent,
-		ClientKind:    store.ClientKindQBit,
-		Category:      "movies",
-		State:         store.StateRemoteActive,
-		RemoteID:      ptr("59006036"),
-		CreatedAt:     time.Now().UTC(),
-		UpdatedAt:     time.Now().UTC(),
+		ID:         "ghost-001",
+		PublicID:   "pub-ghost-001",
+		SourceType: store.SourceTypeTorrent,
+		ClientKind: store.ClientKindQBit,
+		Category:   "movies",
+		State:      store.StateRemoteActive,
+		RemoteID:   ptr("59006036"),
+		CreatedAt:  time.Now().UTC(),
+		UpdatedAt:  time.Now().UTC(),
 	}
 	if err := env.store.CreateJob(context.Background(), job); err != nil {
 		t.Fatal(err)
@@ -157,15 +157,15 @@ func TestProcessPollJob_TransientRetryableStillRetries(t *testing.T) {
 	}
 
 	job := &store.Job{
-		ID:            "retry-001",
-		PublicID:      "pub-retry-001",
-		SourceType:    store.SourceTypeTorrent,
-		ClientKind:    store.ClientKindQBit,
-		Category:      "movies",
-		State:         store.StateRemoteActive,
-		RemoteID:      ptr("59006037"),
-		CreatedAt:     time.Now().UTC(),
-		UpdatedAt:     time.Now().UTC(),
+		ID:         "retry-001",
+		PublicID:   "pub-retry-001",
+		SourceType: store.SourceTypeTorrent,
+		ClientKind: store.ClientKindQBit,
+		Category:   "movies",
+		State:      store.StateRemoteActive,
+		RemoteID:   ptr("59006037"),
+		CreatedAt:  time.Now().UTC(),
+		UpdatedAt:  time.Now().UTC(),
 	}
 	if err := env.store.CreateJob(context.Background(), job); err != nil {
 		t.Fatal(err)
@@ -192,5 +192,76 @@ func TestProcessPollJob_TransientRetryableStillRetries(t *testing.T) {
 	}
 	if got.NextRunAt != nil {
 		t.Error("remote_failed job must not be rescheduled")
+	}
+}
+
+func TestProcessPollJob_ResetsPollAttemptsAfterSuccessfulStatus(t *testing.T) {
+	env := newPollTestEnv(t)
+
+	var calls int
+	env.mock.GetTaskStatusFn = func(_ context.Context, _, _ string) (*torbox.TaskStatus, error) {
+		calls++
+		if calls == 1 {
+			return &torbox.TaskStatus{
+				RemoteID: "remote-recovered-001",
+				State:    "downloading",
+			}, nil
+		}
+		return nil, torbox.MarkRetryable(errors.New("torbox status 503: transient"))
+	}
+
+	now := time.Now().UTC()
+	job := &store.Job{
+		ID:         "recovered-001",
+		PublicID:   "pub-recovered-001",
+		SourceType: store.SourceTypeTorrent,
+		ClientKind: store.ClientKindQBit,
+		Category:   "movies",
+		State:      store.StateRemoteActive,
+		RemoteID:   ptr("59006038"),
+		Metadata:   store.SubmissionMetadata{PollAttempts: maxPollAttempts - 1},
+		CreatedAt:  now,
+		UpdatedAt:  now,
+	}
+	if err := env.store.CreateJob(context.Background(), job); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	got, err := env.store.GetJobByID(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := env.orch.processPollJob(ctx, got); err != nil {
+		t.Fatalf("successful poll: %v", err)
+	}
+
+	got, err = env.store.GetJobByID(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Metadata.PollAttempts != 0 {
+		t.Fatalf("PollAttempts after successful poll = %d, want 0", got.Metadata.PollAttempts)
+	}
+
+	for attempt := 1; attempt < maxPollAttempts; attempt++ {
+		got, err = env.store.GetJobByID(ctx, job.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := env.orch.processPollJob(ctx, got); err != nil {
+			t.Fatalf("retryable poll %d: %v", attempt, err)
+		}
+	}
+
+	got, err = env.store.GetJobByID(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != store.StateRemoteActive {
+		t.Fatalf("state after four consecutive failures = %s, want %s", got.State, store.StateRemoteActive)
+	}
+	if got.Metadata.PollAttempts != maxPollAttempts-1 {
+		t.Errorf("PollAttempts after four consecutive failures = %d, want %d", got.Metadata.PollAttempts, maxPollAttempts-1)
 	}
 }
