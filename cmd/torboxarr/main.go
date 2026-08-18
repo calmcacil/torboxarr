@@ -24,7 +24,9 @@ var version = "dev"
 
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "add" {
-		if err := runAddCommand(context.Background(), os.Args[2:]); err != nil {
+		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+		defer stop()
+		if err := runAddCommand(ctx, os.Args[2:]); err != nil {
 			fmt.Fprintln(os.Stderr, "add:", err)
 			os.Exit(1)
 		}
