@@ -2,10 +2,11 @@
 
 ## Summary
 
-TorBoxarr automatically asks TorBox to start a tracked download that has
-remained confirmed in TorBox's queue for three hours. This prevents valid jobs
-from waiting indefinitely for TorBox's periodic queue processor while retaining
-the existing queued-job reconciliation and duplicate-submission protections.
+When explicitly enabled, TorBoxarr automatically asks TorBox to start a tracked
+download that has remained confirmed in TorBox's queue for a configured
+duration. This gives operators an opt-in fallback for jobs that wait
+indefinitely for TorBox's periodic queue processor while retaining the existing
+queued-job reconciliation and duplicate-submission protections.
 
 ## Problem
 
@@ -40,15 +41,15 @@ forward without an operator using the TorBox Web UI.
 
 ## Behavior
 
-1. Automatic force-start is enabled by default. A tracked job becomes eligible
-   when it has remained in TorBox's queue for three hours without TorBoxarr
-   confirming that it became active.
+1. Automatic force-start is disabled by default. TorBoxarr sends no force-start
+   requests unless the operator configures a positive eligibility duration.
 
-2. Operators can configure the eligibility duration. The configured duration
-   applies to newly queued jobs and jobs already queued when TorBoxarr starts.
-   The default duration is three hours.
+2. A positive configured duration enables automatic force-start. A tracked job
+   becomes eligible after it has remained in TorBox's queue for that duration
+   without TorBoxarr confirming that it became active. A value such as `3h`
+   enables a three-hour policy.
 
-3. Operators can disable automatic force-start entirely. When disabled,
+3. An unset or zero duration disables automatic force-start. When disabled,
    TorBoxarr preserves and polls queued jobs exactly as before and never sends a
    force-start request.
 
@@ -173,14 +174,16 @@ forward without an operator using the TorBox Web UI.
     remains authoritative. The job is not revived, and existing upstream
     removal behavior remains responsible for remote cleanup where applicable.
 
-27. Concurrent pollers, overlapping worker runs, repeated service starts, and
-    multiple TorBoxarr processes sharing the same database must not cause more
-    than one accepted force-start request to be recorded for a queued lifecycle.
+27. In the supported single-service deployment, worker claims and persisted
+    lifecycle metadata suppress ordinary duplicate force-start requests across
+    overlapping worker runs and service restarts. Multiple TorBoxarr processes
+    sharing one database are outside this guarantee.
 
 28. If TorBoxarr crashes after sending the request but before recording the
     outcome, the result is uncertain. On restart, TorBoxarr first reconciles the
     queue and active views. If the same entry remains queued, it may retry after
     the normal retry delay; if active, removed, or absent, it does not retry.
+    Exactly-once delivery across this crash window is not guaranteed.
 
 29. Force-start tracking survives service restarts and image upgrades. A
     restart must not reset a job's queue age, forget an accepted request, or
@@ -203,39 +206,43 @@ forward without an operator using the TorBox Web UI.
     tags, hashes, queue identifiers, active identifiers, or submission
     fingerprints exposed through existing Arr-compatible interfaces.
 
-34. Operators can distinguish at least these events in logs:
+34. Operators can distinguish at least these actionable events in logs:
     - a queued job became eligible;
     - a force-start request was accepted by TorBox;
     - a force-start request failed or had an uncertain outcome;
     - a retry was scheduled;
-    - force-start was skipped because the operation is disabled, unsupported,
-      lacks a queue ID, or removal took precedence; and
+    - an eligible force-start was skipped because the operation is unsupported,
+      lacks a usable queue ID, or removal took precedence; and
     - an accepted force-start was followed by active promotion.
 
 35. Logs identify the local job and TorBox queue entry sufficiently for
     diagnosis but never expose TorBox API tokens, Arr credentials, magnet query
     secrets, NZB passwords, or other configured secrets.
 
-36. Force-start status is available through existing operational diagnostics so
-    an operator can determine whether a queued job is waiting for the threshold,
-    waiting for a retry, or has already had a request accepted. This status does
-    not need to introduce a new Arr-visible torrent state.
+36. Force-start lifecycle timestamps are persisted in job metadata and
+    actionable transitions are emitted as structured logs. Operators can use
+    these existing database and log diagnostics to determine whether a job is
+    waiting for the threshold, waiting for a retry, or has already had a request
+    accepted. No public endpoint or new Arr-visible state is required.
 
-37. The configurable duration accepts a documented duration value. Invalid,
+37. Disabled, below-threshold, retry-throttled, and already-accepted jobs do not
+    emit repetitive informational logs on every queue poll. These routine
+    policy decisions may be available at debug level, but only actionable skips
+    are required in normal logs.
+
+38. The configurable duration accepts a documented duration value. Invalid,
     negative, or otherwise unusable values cause startup configuration
     validation to fail with an actionable error rather than silently selecting
     a different policy.
 
-38. A zero duration is the explicit configuration for disabling automatic
+39. A zero duration is an explicit configuration for disabling automatic
     force-start. Disabled behavior is distinct from a very short positive
     duration and must not result in immediate requests.
 
-39. The default three-hour policy applies when the operator does not configure
-    a value. Existing installations therefore gain automatic force-start after
-    upgrading, while operators who prefer TorBox's unmanaged queue can disable
-    it explicitly.
+40. An unset duration is also disabled. Existing installations do not begin
+    sending state-changing force-start requests merely because they upgrade.
 
-40. Changing the configured duration on restart re-evaluates currently queued
+41. Changing the configured duration on restart re-evaluates currently queued
     jobs against their existing queued-lifecycle age. Shortening the duration
     may make jobs eligible at the next confirmed queue poll; lengthening it
     delays jobs that have not yet received an accepted request. It never causes
