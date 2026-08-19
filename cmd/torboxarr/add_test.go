@@ -84,6 +84,7 @@ type sabAddServerOptions struct {
 	addStatus    int
 	addBody      string
 	addDelay     time.Duration
+	apiKey       string
 }
 
 type sabAddRequestRecord struct {
@@ -96,15 +97,17 @@ type sabAddRequestRecord struct {
 }
 
 type sabAddServer struct {
-	mu    sync.Mutex
-	paths []string
-	adds  []sabAddRequestRecord
+	mu      sync.Mutex
+	paths   []string
+	queries []url.Values
+	adds    []sabAddRequestRecord
 }
 
-func (s *sabAddServer) record(path string) {
+func (s *sabAddServer) record(path string, query url.Values) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.paths = append(s.paths, path)
+	s.queries = append(s.queries, cloneURLValues(query))
 }
 
 func (s *sabAddServer) recordAdd(add sabAddRequestRecord) {
@@ -113,10 +116,22 @@ func (s *sabAddServer) recordAdd(add sabAddRequestRecord) {
 	s.adds = append(s.adds, add)
 }
 
-func (s *sabAddServer) snapshot() ([]string, []sabAddRequestRecord) {
+func (s *sabAddServer) snapshot() ([]string, []url.Values, []sabAddRequestRecord) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return slices.Clone(s.paths), slices.Clone(s.adds)
+	queries := make([]url.Values, len(s.queries))
+	for i, query := range s.queries {
+		queries[i] = cloneURLValues(query)
+	}
+	return slices.Clone(s.paths), queries, slices.Clone(s.adds)
+}
+
+func cloneURLValues(values url.Values) url.Values {
+	clone := make(url.Values, len(values))
+	for key, items := range values {
+		clone[key] = slices.Clone(items)
+	}
+	return clone
 }
 
 func defaultSABAddServerOptions() sabAddServerOptions {
@@ -125,6 +140,7 @@ func defaultSABAddServerOptions() sabAddServerOptions {
 		configBody:   `{"config":{"categories":[{"name":"tv"},{"name":"radarr"}]}}`,
 		addStatus:    http.StatusOK,
 		addBody:      `{"status":true,"nzo_ids":["TBOX-nzo-123"]}`,
+		apiKey:       "sab-secret",
 	}
 }
 
@@ -132,16 +148,24 @@ func newSABAddServer(t *testing.T, opts sabAddServerOptions) (*httptest.Server, 
 	t.Helper()
 	server := &sabAddServer{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		server.record(r.URL.Path)
+		server.record(r.URL.Path, r.URL.Query())
 		if r.URL.Path != "/sabnzbd/api" {
 			http.NotFound(w, r)
 			return
 		}
 		switch r.URL.Query().Get("mode") {
 		case "get_config":
+			if r.URL.Query().Get("apikey") != opts.apiKey {
+				http.Error(w, "API Key Incorrect", http.StatusForbidden)
+				return
+			}
 			w.WriteHeader(opts.configStatus)
 			_, _ = w.Write([]byte(opts.configBody))
 		case "addfile":
+			if r.URL.Query().Get("apikey") != opts.apiKey {
+				http.Error(w, "API Key Incorrect", http.StatusForbidden)
+				return
+			}
 			if opts.addDelay > 0 {
 				select {
 				case <-time.After(opts.addDelay):
@@ -560,11 +584,11 @@ func TestRunAdd_CanceledStatusUnknown(t *testing.T) {
 	}
 
 	err = client.submit(context.Background(), req, "submitted magnet")
-	if err == nil || !strings.Contains(err.Error(), "submission status is unknown") {
-		t.Fatalf("expected unknown status error, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "submission was not sent") {
+		t.Fatalf("expected definitive pre-send cancellation error, got %v", err)
 	}
-	if !strings.Contains(strings.ToLower(err.Error()), "inspect the torboxarr queue") {
-		t.Fatalf("expected queue inspection advice, got %v", err)
+	if strings.Contains(err.Error(), "status is unknown") || strings.Contains(strings.ToLower(err.Error()), "inspect the torboxarr queue") {
+		t.Fatalf("pre-send cancellation must not be uncertain, got %v", err)
 	}
 }
 
@@ -698,6 +722,22 @@ func TestValidateNZBFile_RejectsOversizedFile(t *testing.T) {
 	}
 }
 
+func TestValidateNZBFile_RejectsMissingDirectoryAndNonRegular(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing.nzb")
+	if err := validateNZBFile(missing); err == nil || !strings.Contains(err.Error(), "does not exist") {
+		t.Fatalf("missing file error = %v", err)
+	}
+
+	directory := t.TempDir()
+	if err := validateNZBFile(directory); err == nil || !strings.Contains(err.Error(), "directory") {
+		t.Fatalf("directory error = %v", err)
+	}
+
+	if err := validateNZBFile("/dev/null"); err == nil || !strings.Contains(err.Error(), "regular file") {
+		t.Fatalf("non-regular error = %v", err)
+	}
+}
+
 func TestRunAddNZB_MissingAPIKeyBeforeNetwork(t *testing.T) {
 	t.Setenv("TORBOXARR_SAB_API_KEY", "")
 	srv, server := newSABAddServer(t, defaultSABAddServerOptions())
@@ -707,7 +747,7 @@ func TestRunAddNZB_MissingAPIKeyBeforeNetwork(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "TORBOXARR_SAB_API_KEY") {
 		t.Fatalf("expected API key error, got %v", err)
 	}
-	paths, _ := server.snapshot()
+	paths, _, _ := server.snapshot()
 	if len(paths) != 0 {
 		t.Fatalf("expected no network requests, got %v", paths)
 	}
@@ -727,9 +767,15 @@ func TestRunAddNZB_Success(t *testing.T) {
 		t.Fatalf("confirmation = %q, want non-secret NZB confirmation", output)
 	}
 
-	paths, adds := server.snapshot()
+	paths, queries, adds := server.snapshot()
 	if !slices.Equal(paths, []string{"/sabnzbd/api", "/sabnzbd/api"}) {
 		t.Errorf("request paths = %v, want category lookup then upload", paths)
+	}
+	if len(queries) != 2 || queries[0].Get("mode") != "get_config" || queries[0].Get("output") != "json" || queries[0].Get("apikey") != "sab-secret" {
+		t.Errorf("category lookup query = %v, want authenticated get_config JSON request", queries)
+	}
+	if len(queries) != 2 || queries[1].Get("mode") != "addfile" || queries[1].Get("apikey") != "sab-secret" {
+		t.Errorf("upload query = %v, want authenticated addfile request", queries)
 	}
 	if len(adds) != 1 {
 		t.Fatalf("expected one add request, got %d", len(adds))
@@ -746,6 +792,19 @@ func TestRunAddNZB_Success(t *testing.T) {
 	}
 }
 
+func TestSafeSABNZOID(t *testing.T) {
+	for _, id := range []string{"TBOX-123", "nzo-abc"} {
+		if !safeSABNZOID(id) {
+			t.Errorf("safeSABNZOID(%q) = false, want true", id)
+		}
+	}
+	for _, id := range []string{"", "has space", "has\nnewline", strings.Repeat("x", 257)} {
+		if safeSABNZOID(id) {
+			t.Errorf("safeSABNZOID(%q) = true, want false", id)
+		}
+	}
+}
+
 func TestRunAddNZB_UnknownCategoryDoesNotUpload(t *testing.T) {
 	srv, server := newSABAddServer(t, defaultSABAddServerOptions())
 	withSABAPIKey(t)
@@ -755,7 +814,7 @@ func TestRunAddNZB_UnknownCategoryDoesNotUpload(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "unknown") {
 		t.Fatalf("expected unknown category error, got %v", err)
 	}
-	_, adds := server.snapshot()
+	_, _, adds := server.snapshot()
 	if len(adds) != 0 {
 		t.Fatalf("expected no upload for unknown category, got %d", len(adds))
 	}
@@ -771,6 +830,52 @@ func TestRunAddNZB_RejectsUnacceptedResponse(t *testing.T) {
 	err := runAddInputAt(context.Background(), srv.URL, addInput{Category: "tv", NZBPath: path})
 	if err == nil || !strings.Contains(err.Error(), "rejected") {
 		t.Fatalf("expected SAB rejection, got %v", err)
+	}
+}
+
+func TestRunAddNZB_RejectsMalformedMissingAndMultipleIDs(t *testing.T) {
+	for _, response := range []string{
+		"not json",
+		`{"status":true,"nzo_ids":[]}`,
+		`{"status":true,"nzo_ids":["one","two"]}`,
+		`{"status":true,"nzo_ids":["bad\nvalue"]}`,
+	} {
+		opts := defaultSABAddServerOptions()
+		opts.addBody = response
+		srv, _ := newSABAddServer(t, opts)
+		withSABAPIKey(t)
+		path := writeTempNZB(t, `<nzb></nzb>`)
+
+		err := runAddInputAt(context.Background(), srv.URL, addInput{Category: "tv", NZBPath: path})
+		if err == nil || !strings.Contains(err.Error(), "rejected") {
+			t.Errorf("response %q: expected rejection, got %v", response, err)
+		}
+	}
+}
+
+func TestRunAddNZB_RejectsAuthenticationFailure(t *testing.T) {
+	opts := defaultSABAddServerOptions()
+	opts.configStatus = http.StatusForbidden
+	srv, _ := newSABAddServer(t, opts)
+	withSABAPIKey(t)
+	path := writeTempNZB(t, `<nzb></nzb>`)
+
+	err := runAddInputAt(context.Background(), srv.URL, addInput{Category: "tv", NZBPath: path})
+	if err == nil || !strings.Contains(err.Error(), "authentication failed") || strings.Contains(err.Error(), "sab-secret") {
+		t.Fatalf("expected redacted SAB authentication failure, got %v", err)
+	}
+}
+
+func TestRunAddNZB_RejectsServerError(t *testing.T) {
+	opts := defaultSABAddServerOptions()
+	opts.addStatus = http.StatusInternalServerError
+	srv, _ := newSABAddServer(t, opts)
+	withSABAPIKey(t)
+	path := writeTempNZB(t, `<nzb></nzb>`)
+
+	err := runAddInputAt(context.Background(), srv.URL, addInput{Category: "tv", NZBPath: path})
+	if err == nil || !strings.Contains(err.Error(), "rejected") || strings.Contains(err.Error(), "status is unknown") {
+		t.Fatalf("expected definitive SAB server rejection, got %v", err)
 	}
 }
 

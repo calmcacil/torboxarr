@@ -296,14 +296,14 @@ func normalizeBTIH(v string) string {
 
 func deriveDisplayName(displayName, sourceURI, payloadName, infoHash, fallback string) string {
 	switch {
-	case strings.TrimSpace(displayName) != "":
+	case strings.TrimSpace(displayName) != "" && strings.TrimSpace(displayName) != strings.TrimSpace(sourceURI):
 		return strings.TrimSpace(displayName)
 	case strings.TrimSpace(payloadName) != "":
 		return strings.TrimSpace(payloadName)
 	case strings.TrimSpace(infoHash) != "":
 		return strings.TrimSpace(infoHash)
 	case strings.TrimSpace(sourceURI) != "":
-		return strings.TrimSpace(sourceURI)
+		return "download"
 	default:
 		return fallback
 	}
@@ -350,7 +350,7 @@ func sanitizeQuery(values url.Values) map[string]string {
 	out := make(map[string]string, len(values))
 	for key, items := range values {
 		switch strings.ToLower(key) {
-		case "apikey", "nzbkey", "token", "username", "password", "pass":
+		case "apikey", "nzbkey", "token", "username", "password", "pass", "urls", "url", "name":
 			out[key] = "[redacted]"
 		default:
 			out[key] = strings.Join(items, ",")

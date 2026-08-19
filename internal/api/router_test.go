@@ -17,6 +17,7 @@ import (
 
 	"github.com/mrjoiny/torboxarr/internal/api"
 	"github.com/mrjoiny/torboxarr/internal/auth"
+	"github.com/mrjoiny/torboxarr/internal/compat"
 	"github.com/mrjoiny/torboxarr/internal/config"
 	"github.com/mrjoiny/torboxarr/internal/files"
 	"github.com/mrjoiny/torboxarr/internal/store"
@@ -270,6 +271,30 @@ func TestQBitAdd_URL(t *testing.T) {
 	}
 	if jobs[0].Category != "movies" {
 		t.Errorf("Category = %q, want %q", jobs[0].Category, "movies")
+	}
+}
+
+func TestQBitAdd_URLDoesNotPersistMagnetAsDisplayName(t *testing.T) {
+	env := newTestEnv(t)
+	sid := env.loginQBit(t)
+	magnet := "magnet:?xt=urn:btih:not-a-canonical-hash&tr=https%3A%2F%2Fsecret.example%2Fannounce%3Ftoken%3Dprivate"
+	rec := env.qbitMultipartAdd(t, sid, map[string]string{
+		"urls":     magnet,
+		"category": "movies",
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	jobs, err := env.store.ListVisibleClientJobs(context.Background(), store.ClientKindQBit, "movies", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("got %d jobs, want 1", len(jobs))
+	}
+	if strings.Contains(jobs[0].DisplayName, "magnet:") || strings.Contains(jobs[0].DisplayName, "secret") {
+		t.Fatalf("display name leaked source URI: %q", jobs[0].DisplayName)
 	}
 }
 
@@ -697,6 +722,26 @@ func TestSABAddURL_NoAuth(t *testing.T) {
 
 	if rec.Code != http.StatusForbidden {
 		t.Errorf("status = %d, want %d for missing API key", rec.Code, http.StatusForbidden)
+	}
+}
+
+func TestSABAddFile_RejectsOversizedRequestBeforePersistence(t *testing.T) {
+	env := newTestEnv(t)
+	req := httptest.NewRequest(http.MethodPost, "/sabnzbd/api?mode=addfile&apikey=sabapikey123", strings.NewReader("oversized"))
+	req.Header.Set("Content-Type", "multipart/form-data; boundary=unused")
+	req.ContentLength = compat.MaxSABUploadBytes + 1
+	rec := httptest.NewRecorder()
+	env.router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusRequestEntityTooLarge)
+	}
+	jobs, err := env.store.ListVisibleClientJobs(context.Background(), store.ClientKindSAB, "", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 0 {
+		t.Fatalf("got %d persisted jobs, want none", len(jobs))
 	}
 }
 

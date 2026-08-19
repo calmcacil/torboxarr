@@ -48,6 +48,10 @@ func (s *Server) handleSABAPI(w http.ResponseWriter, r *http.Request) {
 	// included in this switch to ensure the body is parsed.
 	switch mode {
 	case "addurl", "addfile", "queue", "history", "set_config":
+		if r.ContentLength > compat.MaxSABUploadBytes {
+			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]any{"error": "request body too large"})
+			return
+		}
 		if strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/") {
 			if err := r.ParseMultipartForm(2 << 20); err != nil {
 				writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid multipart body"})

@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/mrjoiny/torboxarr/internal/compat"
 )
@@ -313,8 +314,11 @@ func doAddSubmission(client *http.Client, req *http.Request, reachability, queue
 	req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
 	resp, err := client.Do(req)
 	if err != nil {
-		if wroteRequest || interrupted(err) {
+		if wroteRequest {
 			return nil, fmt.Errorf("submission status is unknown: the request may have reached the server; %s", queueAdvice)
+		}
+		if interrupted(err) {
+			return nil, fmt.Errorf("submission was not sent: request canceled before transmission")
 		}
 		return nil, errors.New(reachability)
 	}
@@ -592,40 +596,38 @@ func (c *sabAddClient) submitFile(ctx context.Context, category, nzbPath string)
 	}
 	defer file.Close()
 
-	var body bytes.Buffer
-	writer := multipart.NewWriter(&body)
-	for key, value := range map[string]string{
-		"mode":   "addfile",
-		"output": "json",
-		"cat":    category,
-	} {
-		if err := writer.WriteField(key, value); err != nil {
-			return fmt.Errorf("cannot build NZB submission: %w", err)
-		}
-	}
-	part, err := writer.CreateFormFile("nzbfile", filepath.Base(nzbPath))
+	info, err := file.Stat()
 	if err != nil {
-		return fmt.Errorf("cannot build NZB submission: %w", err)
+		return fmt.Errorf("cannot stat NZB file %s: %w", nzbPath, err)
 	}
-	if _, err := io.Copy(part, file); err != nil {
-		return fmt.Errorf("cannot build NZB submission: %w", err)
+	if !info.Mode().IsRegular() || info.Size() <= 0 {
+		return fmt.Errorf("NZB file %s changed after validation", nzbPath)
 	}
-	if err := writer.Close(); err != nil {
-		return fmt.Errorf("cannot build NZB submission: %w", err)
+
+	header, trailer, contentType, err := nzbMultipartParts(category, filepath.Base(nzbPath))
+	if err != nil {
+		return err
 	}
-	if int64(body.Len()) > maxNZBFileBytes {
+	bodySize := int64(len(header)) + info.Size() + int64(len(trailer))
+	if bodySize > maxNZBFileBytes {
 		return fmt.Errorf("NZB submission exceeds the maximum upload size of %d MiB", maxNZBFileBytes/(1<<20))
 	}
 
+	body := io.MultiReader(
+		bytes.NewReader(header),
+		io.LimitReader(file, info.Size()),
+		bytes.NewReader(trailer),
+	)
 	query := url.Values{}
 	query.Set("mode", "addfile")
 	query.Set("apikey", c.apiKey)
 	endpoint := addEndpoint(c.baseURL, "/sabnzbd/api") + "?" + query.Encode()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, &body)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, body)
 	if err != nil {
 		return fmt.Errorf("cannot prepare NZB submission request")
 	}
-	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.ContentLength = bodySize
+	req.Header.Set("Content-Type", contentType)
 
 	resp, err := doAddSubmission(c.http, req,
 		"cannot reach the TorBoxarr server",
@@ -653,8 +655,48 @@ func (c *sabAddClient) submitFile(ctx context.Context, category, nzbPath string)
 	if !result.Status || len(result.NzoIDs) != 1 || strings.TrimSpace(result.NzoIDs[0]) == "" {
 		return fmt.Errorf("the SAB server rejected the submission: response did not confirm one accepted NZB")
 	}
-	fmt.Printf("submitted NZB file %s to category %q with NZO ID %s\n", filepath.Base(nzbPath), category, result.NzoIDs[0])
+	nzoID := strings.TrimSpace(result.NzoIDs[0])
+	if !safeSABNZOID(nzoID) {
+		return fmt.Errorf("the SAB server rejected the submission: response contained an unsafe NZO ID")
+	}
+	fmt.Printf("submitted NZB file %s to category %q with NZO ID %s\n", filepath.Base(nzbPath), category, nzoID)
 	return nil
+}
+
+func nzbMultipartParts(category, filename string) (header, trailer []byte, contentType string, err error) {
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	for _, field := range [][2]string{
+		{"mode", "addfile"},
+		{"output", "json"},
+		{"cat", category},
+	} {
+		if err := writer.WriteField(field[0], field[1]); err != nil {
+			return nil, nil, "", fmt.Errorf("cannot build NZB submission: %w", err)
+		}
+	}
+	if _, err := writer.CreateFormFile("nzbfile", filename); err != nil {
+		return nil, nil, "", fmt.Errorf("cannot build NZB submission: %w", err)
+	}
+	header = append([]byte(nil), body.Bytes()...)
+	contentType = writer.FormDataContentType()
+	if err := writer.Close(); err != nil {
+		return nil, nil, "", fmt.Errorf("cannot build NZB submission: %w", err)
+	}
+	trailer = append([]byte(nil), body.Bytes()[len(header):]...)
+	return header, trailer, contentType, nil
+}
+
+func safeSABNZOID(v string) bool {
+	if v == "" || len(v) > 256 {
+		return false
+	}
+	for _, r := range v {
+		if unicode.IsControl(r) || unicode.IsSpace(r) {
+			return false
+		}
+	}
+	return true
 }
 
 func isValidTorrent(data []byte) bool {

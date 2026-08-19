@@ -247,3 +247,5 @@ go test -race -count=1 -p 1 -parallel=1 ./...
   uncertain-outcome reporting are implemented.
 - Real-router integration coverage verifies all three source types, persisted
   payloads, source metadata, and duplicate handling.
+- Source URIs are redacted from compatibility logs and fallback display names,
+  and returned NZO IDs are checked before confirmation output.
