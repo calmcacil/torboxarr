@@ -68,6 +68,7 @@ Optional overrides:
 | `TORBOXARR_DATA_ROOT` | `/data` | Root directory for staging, completed files, and payloads |
 | `TORBOXARR_DATABASE_PATH` | `/config/torboxarr.db` | SQLite database path; the container stores state under `/config` |
 | `TORBOXARR_LOG_LEVEL` | `INFO` | Log verbosity: DEBUG, INFO, WARN, or ERROR |
+| `TORBOXARR_REMOTE_ABSENCE_ATTEMPTS` | `5` | Successful queue/active absence checks before a remote job is marked failed |
 | `TORBOXARR_SAB_NZB_KEY` | falls back to `TORBOXARR_SAB_API_KEY` | Explicit key for the SABnzbd-compatible endpoint; omit it to reuse the SAB API key |
 | `TORBOXARR_UPSTREAM_REMOVE` | `false` | When true, removing a download also deletes the matching task from TorBox's servers, so cached entries don't accumulate there |
 

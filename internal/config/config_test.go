@@ -108,6 +108,16 @@ func TestDefaultConfigKeepsTorBoxCreateHourlyLimit(t *testing.T) {
 	}
 }
 
+func TestApplyEnvReadsRemoteAbsenceAttempts(t *testing.T) {
+	cfg := defaultConfig()
+	t.Setenv("TORBOXARR_REMOTE_ABSENCE_ATTEMPTS", "9")
+
+	applyEnv(&cfg)
+	if cfg.Workers.RemoteAbsenceAttempts != 9 {
+		t.Fatalf("RemoteAbsenceAttempts = %d, want 9", cfg.Workers.RemoteAbsenceAttempts)
+	}
+}
+
 func TestLoadDotEnvSetsUnsetVariablesOnly(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, ".env")

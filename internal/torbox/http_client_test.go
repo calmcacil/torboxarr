@@ -40,6 +40,7 @@ func TestCreateTorrentTask_Success(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Write(jsonEnvelope(map[string]any{
 			"torrent_id": 42,
+			"id":         42,
 			"hash":       "abc123hash",
 			"name":       "Test Torrent",
 		}))
@@ -55,8 +56,34 @@ func TestCreateTorrentTask_Success(t *testing.T) {
 	if resp.RemoteID != "42" {
 		t.Errorf("RemoteID = %q, want %q", resp.RemoteID, "42")
 	}
+	if !resp.ActiveIDExplicit {
+		t.Error("ActiveIDExplicit = false, want true for torrent_id response")
+	}
 	if resp.RemoteHash != "abc123hash" {
 		t.Errorf("RemoteHash = %q, want %q", resp.RemoteHash, "abc123hash")
+	}
+}
+
+func TestCreateTorrentTask_GenericIDIsQueuedUntilActive(t *testing.T) {
+	client, _ := newTestHTTPClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(jsonEnvelope(map[string]any{
+			"id":   42,
+			"hash": "queued-hash",
+		}))
+	})
+
+	resp, err := client.CreateTorrentTask(t.Context(), torbox.CreateTorrentTaskRequest{
+		Magnet: "magnet:?xt=urn:btih:queued",
+	})
+	if err != nil {
+		t.Fatalf("CreateTorrentTask: %v", err)
+	}
+	if resp.RemoteID != "" {
+		t.Errorf("RemoteID = %q, want empty until active confirmation", resp.RemoteID)
+	}
+	if resp.QueuedID != "42" {
+		t.Errorf("QueuedID = %q, want %q", resp.QueuedID, "42")
 	}
 }
 
@@ -265,6 +292,196 @@ func TestGetTaskStatus_Found(t *testing.T) {
 	}
 	if status.Hash != "hashvalue" {
 		t.Errorf("Hash = %q, want %q", status.Hash, "hashvalue")
+	}
+}
+
+func TestGetQueuedStatus_GenericIDIsNotActiveID(t *testing.T) {
+	client, _ := newTestHTTPClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/queued/getqueued" {
+			t.Errorf("path = %q, want queued endpoint", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(jsonEnvelope(map[string]any{
+			"id":   42,
+			"hash": "queued-hash",
+			"name": "Queued task",
+		}))
+	})
+
+	status, err := client.GetQueuedStatus(t.Context(), "torrent", "42")
+	if err != nil {
+		t.Fatalf("GetQueuedStatus: %v", err)
+	}
+	if status == nil {
+		t.Fatal("expected queued status")
+	}
+	if status.QueuedID != "42" {
+		t.Errorf("QueuedID = %q, want %q", status.QueuedID, "42")
+	}
+	if status.RemoteID != "" {
+		t.Errorf("RemoteID = %q, want empty for queued item", status.RemoteID)
+	}
+}
+
+func TestFindQueuedTaskFallsBackToFullListAfterIDError(t *testing.T) {
+	var calls int
+	client, _ := newTestHTTPClient(t, func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if r.URL.Query().Get("id") != "" {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"success":false,"error":"DATABASE_ERROR"}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(jsonEnvelope(map[string]any{
+			"id":   42,
+			"hash": "queued-hash",
+		}))
+	})
+
+	status, err := client.FindQueuedTask(t.Context(), "torrent", "42", "", "queued-hash")
+	if err != nil {
+		t.Fatalf("FindQueuedTask: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("request count = %d, want 2", calls)
+	}
+	if status == nil || status.QueuedID != "42" || status.RemoteID != "" {
+		t.Fatalf("status = %#v, want queued ID 42 without active ID", status)
+	}
+}
+
+func TestFindQueuedTaskUsesUsenetQueueTypeAndAuthID(t *testing.T) {
+	client, _ := newTestHTTPClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Query().Get("type"); got != "usenet" {
+			t.Errorf("type = %q, want usenet", got)
+		}
+		if got := r.URL.Query().Get("id"); got != "" {
+			t.Errorf("id = %q, want empty for Usenet queue lookup", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(jsonEnvelope(map[string]any{
+			"id":      7,
+			"auth_id": "auth-7",
+			"hash":    "usenet-hash",
+			"name":    "Queued NZB",
+		}))
+	})
+
+	status, err := client.FindQueuedTask(t.Context(), "nzb", "", "auth-7", "usenet-hash")
+	if err != nil {
+		t.Fatalf("FindQueuedTask: %v", err)
+	}
+	if status == nil || status.QueueAuthID != "auth-7" {
+		t.Fatalf("status = %#v, want auth ID auth-7", status)
+	}
+}
+
+func TestFindActiveTaskFallsBackToFullListAfterIDError(t *testing.T) {
+	var calls int
+	client, _ := newTestHTTPClient(t, func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if r.URL.Query().Get("id") != "" {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"success":false,"error":"DATABASE_ERROR"}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(jsonEnvelope(map[string]any{
+			"torrent_id":     99,
+			"hash":           "active-hash",
+			"download_state": "downloading",
+		}))
+	})
+
+	status, err := client.FindActiveTask(t.Context(), "torrent", "42", "", "active-hash")
+	if err != nil {
+		t.Fatalf("FindActiveTask: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("request count = %d, want 2", calls)
+	}
+	if status == nil || status.RemoteID != "99" {
+		t.Fatalf("status = %#v, want active remote ID 99", status)
+	}
+}
+
+func TestFindActiveTaskFullListCanConfirmExplicitIDAfterIDError(t *testing.T) {
+	var calls int
+	client, _ := newTestHTTPClient(t, func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if r.URL.Query().Get("id") != "" {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"success":false,"error":"DATABASE_ERROR"}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(jsonEnvelope(map[string]any{
+			"torrent_id":     42,
+			"hash":           "active-hash",
+			"download_state": "downloading",
+		}))
+	})
+
+	status, err := client.FindActiveTask(t.Context(), "torrent", "42", "", "active-hash")
+	if err != nil {
+		t.Fatalf("FindActiveTask: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("request count = %d, want 2", calls)
+	}
+	if status == nil || status.RemoteID != "42" {
+		t.Fatalf("status = %#v, want active remote ID 42", status)
+	}
+}
+
+func TestFindActiveTaskMatchesHashWithoutRemoteID(t *testing.T) {
+	client, _ := newTestHTTPClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Query().Get("id"); got != "" {
+			t.Errorf("id = %q, want empty for hash lookup", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(jsonEnvelope(map[string]any{
+			"torrent_id":     99,
+			"hash":           "hash-only",
+			"download_state": "downloading",
+		}))
+	})
+
+	status, err := client.FindActiveTask(t.Context(), "torrent", "", "", "hash-only")
+	if err != nil {
+		t.Fatalf("FindActiveTask: %v", err)
+	}
+	if status == nil || status.RemoteID != "99" {
+		t.Fatalf("status = %#v, want active remote ID 99", status)
+	}
+}
+
+func TestFindActiveTaskFallsBackToAuthIDAfterEmptyIDResult(t *testing.T) {
+	var calls int
+	client, _ := newTestHTTPClient(t, func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Query().Get("id") != "" {
+			w.Write(jsonEnvelope([]any{}))
+			return
+		}
+		w.Write(jsonEnvelope(map[string]any{
+			"usenet_id":      99,
+			"auth_id":        "auth-only",
+			"download_state": "downloading",
+		}))
+	})
+
+	status, err := client.FindActiveTask(t.Context(), "nzb", "42", "auth-only", "")
+	if err != nil {
+		t.Fatalf("FindActiveTask: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("request count = %d, want 2", calls)
+	}
+	if status == nil || status.RemoteID != "99" {
+		t.Fatalf("status = %#v, want active remote ID 99", status)
 	}
 }
 

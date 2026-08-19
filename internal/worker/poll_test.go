@@ -76,13 +76,11 @@ func newPollTestEnv(t *testing.T) *pollTestEnv {
 	return &pollTestEnv{orch: orch, store: st, mock: mock, dir: dir}
 }
 
-// TestProcessPollJob_LogicalErrorEscalatesAfterMaxAttempts verifies that a task
-// whose upstream entry returns a structured TorBox error (e.g. a deleted or
-// nonexistent task -> 500 with success:false) is retried a bounded number of
-// times and then moved to remote_failed rather than polling forever. This is
-// the exact scenario observed in production: a torrent deleted upstream keeps
-// returning DATABASE_ERROR on every poll.
-func TestProcessPollJob_LogicalErrorEscalatesAfterMaxAttempts(t *testing.T) {
+// TestProcessPollJob_LogicalErrorRemainsNonTerminal verifies that a structured
+// TorBox error is retried without treating the lookup failure as confirmed
+// absence. This is important for queue-only IDs, which can return DATABASE_ERROR
+// from the active endpoint while remaining present in TorBox's queue.
+func TestProcessPollJob_LogicalErrorRemainsNonTerminal(t *testing.T) {
 	env := newPollTestEnv(t)
 
 	var calls int
@@ -113,15 +111,8 @@ func TestProcessPollJob_LogicalErrorEscalatesAfterMaxAttempts(t *testing.T) {
 			t.Fatal(err)
 		}
 		err = env.orch.processPollJob(ctx, got)
-		switch {
-		case attempt < maxPollAttempts:
-			if err != nil {
-				t.Fatalf("attempt %d: expected retry (no error), got %v", attempt, err)
-			}
-		default:
-			if err != nil {
-				t.Fatalf("attempt %d: expected escalation (no error), got %v", attempt, err)
-			}
+		if err != nil {
+			t.Fatalf("attempt %d: expected retry (no error), got %v", attempt, err)
 		}
 	}
 
@@ -133,20 +124,19 @@ func TestProcessPollJob_LogicalErrorEscalatesAfterMaxAttempts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.State != store.StateRemoteFailed {
-		t.Errorf("after max attempts the job must become remote_failed; state=%s", got.State)
+	if got.State != store.StateRemoteActive {
+		t.Errorf("lookup errors must remain non-terminal; state=%s", got.State)
 	}
-	if got.Metadata.PollAttempts != maxPollAttempts {
-		t.Errorf("expected PollAttempts=%d, got %d", maxPollAttempts, got.Metadata.PollAttempts)
+	if got.Metadata.PollAttempts != 0 {
+		t.Errorf("lookup errors must not increment PollAttempts; got %d", got.Metadata.PollAttempts)
 	}
-	if got.NextRunAt != nil {
-		t.Error("remote_failed job must not be rescheduled")
+	if got.NextRunAt == nil {
+		t.Error("lookup error should schedule another poll")
 	}
 }
 
-// TestProcessPollJob_TransientRetryableStillRetries confirms the same cap
-// applies to transport-level retryable errors (e.g. a real TorBox outage), so
-// a temporary blip does not immediately fail the job.
+// TestProcessPollJob_TransientRetryableStillRetries confirms transport-level
+// retryable errors remain non-terminal and do not count as confirmed absence.
 func TestProcessPollJob_TransientRetryableStillRetries(t *testing.T) {
 	env := newPollTestEnv(t)
 
@@ -187,11 +177,14 @@ func TestProcessPollJob_TransientRetryableStillRetries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.State != store.StateRemoteFailed {
-		t.Errorf("after max attempts the job must become remote_failed; state=%s", got.State)
+	if got.State != store.StateRemoteActive {
+		t.Errorf("lookup errors must remain non-terminal; state=%s", got.State)
 	}
-	if got.NextRunAt != nil {
-		t.Error("remote_failed job must not be rescheduled")
+	if got.Metadata.PollAttempts != 0 {
+		t.Errorf("lookup errors must not increment PollAttempts; got %d", got.Metadata.PollAttempts)
+	}
+	if got.NextRunAt == nil {
+		t.Error("lookup error should schedule another poll")
 	}
 }
 
@@ -261,7 +254,7 @@ func TestProcessPollJob_ResetsPollAttemptsAfterSuccessfulStatus(t *testing.T) {
 	if got.State != store.StateRemoteActive {
 		t.Fatalf("state after four consecutive failures = %s, want %s", got.State, store.StateRemoteActive)
 	}
-	if got.Metadata.PollAttempts != maxPollAttempts-1 {
-		t.Errorf("PollAttempts after four consecutive failures = %d, want %d", got.Metadata.PollAttempts, maxPollAttempts-1)
+	if got.Metadata.PollAttempts != 0 {
+		t.Errorf("PollAttempts after lookup failures = %d, want 0", got.Metadata.PollAttempts)
 	}
 }

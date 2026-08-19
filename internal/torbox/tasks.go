@@ -62,7 +62,7 @@ func (c *HTTPClient) CreateTorrentTask(ctx context.Context, req CreateTorrentTas
 	if err != nil {
 		return nil, err
 	}
-	return parseCreateTask(env)
+	return parseCreateTask(env, req.AsQueued)
 }
 
 func (c *HTTPClient) CreateUsenetTask(ctx context.Context, req CreateUsenetTaskRequest) (*CreateTaskResponse, error) {
@@ -114,7 +114,7 @@ func (c *HTTPClient) CreateUsenetTask(ctx context.Context, req CreateUsenetTaskR
 	if err != nil {
 		return nil, err
 	}
-	return parseCreateTask(env)
+	return parseCreateTask(env, req.AsQueued)
 }
 
 func (c *HTTPClient) GetTaskStatus(ctx context.Context, sourceType string, remoteID string) (*TaskStatus, error) {
@@ -123,34 +123,76 @@ func (c *HTTPClient) GetTaskStatus(ctx context.Context, sourceType string, remot
 }
 
 func (c *HTTPClient) GetQueuedStatus(ctx context.Context, sourceType string, queuedID string) (*TaskStatus, error) {
-	c.debug("fetching torbox queued status", "source_type", sourceType, "queued_id", queuedID)
 	if strings.TrimSpace(queuedID) == "" {
 		return nil, fmt.Errorf("queued id is required")
+	}
+	return c.FindQueuedTask(ctx, sourceType, queuedID, "", "")
+}
+
+func (c *HTTPClient) FindQueuedTask(ctx context.Context, sourceType, queuedID, queueAuthID, remoteHash string) (*TaskStatus, error) {
+	c.debug("fetching torbox queued status", "source_type", sourceType, "queued_id", queuedID, "queue_auth_id", queueAuthID, "has_hash", strings.TrimSpace(remoteHash) != "")
+	if strings.TrimSpace(queuedID) == "" && strings.TrimSpace(queueAuthID) == "" && strings.TrimSpace(remoteHash) == "" {
+		return nil, fmt.Errorf("queued id, queue auth id, or remote hash is required")
 	}
 	if err := c.wait(ctx, c.pollLimiter); err != nil {
 		return nil, err
 	}
 	items, err := c.getQueuedItems(ctx, sourceType, queuedID)
+	queueListFallback := false
+	lookupErr := err
 	if err != nil {
-		return nil, err
-	}
-	for _, item := range items {
-		if extractQueuedID(item) != strings.TrimSpace(queuedID) {
-			continue
+		if strings.TrimSpace(queuedID) == "" || isUsenetSource(sourceType) {
+			return nil, err
 		}
-		status := parseTaskStatus(sourceType, item)
-		status.QueuedID = extractQueuedID(item)
-		status.QueueAuthID = extractQueueAuthID(sourceType, item)
-		c.debug("received torbox queued status",
-			"source_type", sourceType,
-			"queued_id", queuedID,
-			"state", status.State,
-			"queue_auth_id", status.QueueAuthID,
-			"remote_id", status.RemoteID,
-		)
+		// TorBox can reject an active-looking queue ID even while the queue
+		// list is available. Retry without the ID so the content hash can
+		// reconcile the two views.
+		items, err = c.getQueuedItems(ctx, sourceType, "")
+		if err != nil {
+			return nil, err
+		}
+		queueListFallback = true
+	}
+	if status, matched := matchQueuedTask(sourceType, items, queuedID, queueAuthID, remoteHash); matched {
 		return status, nil
 	}
+	if !queueListFallback && !isUsenetSource(sourceType) && strings.TrimSpace(queuedID) != "" {
+		// An ID-filtered queue request can return an empty successful result
+		// while the item is still present in the unfiltered queue.
+		items, err = c.getQueuedItems(ctx, sourceType, "")
+		if err != nil {
+			return nil, err
+		}
+		if status, matched := matchQueuedTask(sourceType, items, queuedID, queueAuthID, remoteHash); matched {
+			return status, nil
+		}
+	}
+	if queueListFallback {
+		return nil, lookupErr
+	}
 	return nil, nil
+}
+
+func matchQueuedTask(sourceType string, items []map[string]any, queuedID, queueAuthID, remoteHash string) (*TaskStatus, bool) {
+	for _, item := range items {
+		itemID := extractQueuedID(item)
+		itemAuthID := extractQueueAuthID(sourceType, item)
+		itemHash := firstString(item, "hash")
+		if identifiersConflict(itemHash, remoteHash) {
+			continue
+		}
+		matchesID := strings.TrimSpace(queuedID) != "" && itemID == strings.TrimSpace(queuedID)
+		matchesAuthID := isUsenetSource(sourceType) && strings.TrimSpace(queueAuthID) != "" && itemAuthID == strings.TrimSpace(queueAuthID)
+		matchesHash := strings.TrimSpace(remoteHash) != "" && strings.EqualFold(itemHash, strings.TrimSpace(remoteHash))
+		if !matchesID && !matchesAuthID && !matchesHash {
+			continue
+		}
+		status := parseTaskStatus(sourceType, item, false)
+		status.QueuedID = itemID
+		status.QueueAuthID = itemAuthID
+		return status, true
+	}
+	return nil, false
 }
 
 func (c *HTTPClient) FindActiveTask(ctx context.Context, sourceType string, remoteID, queueAuthID, remoteHash string) (*TaskStatus, error) {
@@ -164,35 +206,74 @@ func (c *HTTPClient) FindActiveTask(ctx context.Context, sourceType string, remo
 		return nil, err
 	}
 	items, err := c.getRemoteItems(ctx, sourceType, remoteID)
+	activeListFallback := false
+	lookupErr := err
 	if err != nil {
-		return nil, err
+		if strings.TrimSpace(remoteID) == "" {
+			return nil, err
+		}
+		// A stale queue ID can make the ID-filtered active endpoint fail. A
+		// full active list can confirm the ID directly or use the other
+		// available identities.
+		items, err = c.getRemoteItems(ctx, sourceType, "")
+		if err != nil {
+			return nil, err
+		}
+		activeListFallback = true
 	}
+	status, matched := matchActiveTask(sourceType, items, remoteID, queueAuthID, remoteHash)
+	if matched {
+		return status, nil
+	}
+	if !activeListFallback && strings.TrimSpace(remoteID) != "" && (strings.TrimSpace(remoteHash) != "" || strings.TrimSpace(queueAuthID) != "") {
+		// The ID-filtered endpoint may return an empty successful response for
+		// a queue ID rather than an HTTP error. Reconcile by hash as well.
+		items, err = c.getRemoteItems(ctx, sourceType, "")
+		if err != nil {
+			return nil, err
+		}
+		status, matched = matchActiveTask(sourceType, items, "", queueAuthID, remoteHash)
+		if matched {
+			return status, nil
+		}
+	}
+	if activeListFallback {
+		return nil, lookupErr
+	}
+	return nil, nil
+}
+
+func matchActiveTask(sourceType string, items []map[string]any, remoteID, queueAuthID, remoteHash string) (*TaskStatus, bool) {
 	for _, item := range items {
 		itemID := extractActiveID(sourceType, item, true)
 		itemHash := firstString(item, "hash")
-		itemAuthID := firstString(item, "auth_id")
+		itemAuthID := extractQueueAuthID(sourceType, item)
+		if identifiersConflict(itemHash, remoteHash) {
+			continue
+		}
 
 		switch {
 		case strings.TrimSpace(remoteID) != "" && itemID == strings.TrimSpace(remoteID):
-		case strings.EqualFold(sourceType, "usenet") && strings.TrimSpace(queueAuthID) != "" && itemAuthID == strings.TrimSpace(queueAuthID):
-		case strings.TrimSpace(remoteHash) != "" && itemHash == strings.TrimSpace(remoteHash):
+		case isUsenetSource(sourceType) && strings.TrimSpace(queueAuthID) != "" && itemAuthID == strings.TrimSpace(queueAuthID):
+		case strings.TrimSpace(remoteHash) != "" && strings.EqualFold(itemHash, strings.TrimSpace(remoteHash)):
 		default:
 			continue
 		}
 
-		status := parseTaskStatus(sourceType, item)
-		c.debug("matched active torbox task",
-			"source_type", sourceType,
-			"remote_id", status.RemoteID,
-			"queue_auth_id", status.QueueAuthID,
-			"state", status.State,
-			"label", status.Label,
-			"download_ready", status.DownloadReady,
-			"files", len(status.Files),
-		)
-		return status, nil
+		status := parseTaskStatus(sourceType, item, true)
+		return status, true
 	}
-	return nil, nil
+	return nil, false
+}
+
+func identifiersConflict(candidateHash, expectedHash string) bool {
+	candidateHash = strings.TrimSpace(candidateHash)
+	expectedHash = strings.TrimSpace(expectedHash)
+	return candidateHash != "" && expectedHash != "" && !strings.EqualFold(candidateHash, expectedHash)
+}
+
+func isUsenetSource(sourceType string) bool {
+	return strings.EqualFold(sourceType, "usenet") || strings.EqualFold(sourceType, "nzb")
 }
 
 func (c *HTTPClient) getRemoteItems(ctx context.Context, sourceType string, remoteID string) ([]map[string]any, error) {
@@ -220,9 +301,13 @@ func (c *HTTPClient) getRemoteItems(ctx context.Context, sourceType string, remo
 
 func (c *HTTPClient) getQueuedItems(ctx context.Context, sourceType string, queuedID string) ([]map[string]any, error) {
 	query := url.Values{}
-	query.Set("type", strings.ToLower(sourceType))
+	queueType := strings.ToLower(sourceType)
+	if queueType == "nzb" {
+		queueType = "usenet"
+	}
+	query.Set("type", queueType)
 	query.Set("bypass_cache", "true")
-	if !strings.EqualFold(sourceType, "usenet") && strings.TrimSpace(queuedID) != "" {
+	if !isUsenetSource(sourceType) && strings.TrimSpace(queuedID) != "" {
 		query.Set("id", strings.TrimSpace(queuedID))
 	}
 

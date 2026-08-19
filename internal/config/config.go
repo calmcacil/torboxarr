@@ -69,16 +69,17 @@ type Config struct {
 	}
 
 	Workers struct {
-		SubmitInterval   time.Duration
-		PollInterval     time.Duration
-		DownloadInterval time.Duration
-		FinalizeInterval time.Duration
-		RemoveInterval   time.Duration
-		PruneInterval    time.Duration
-		SubmitRetryMin   time.Duration
-		SubmitRetryMax   time.Duration
-		RemovedRetention time.Duration
-		BatchSize        int
+		SubmitInterval        time.Duration
+		PollInterval          time.Duration
+		DownloadInterval      time.Duration
+		FinalizeInterval      time.Duration
+		RemoveInterval        time.Duration
+		PruneInterval         time.Duration
+		SubmitRetryMin        time.Duration
+		SubmitRetryMax        time.Duration
+		RemovedRetention      time.Duration
+		RemoteAbsenceAttempts int
+		BatchSize             int
 	}
 }
 
@@ -125,6 +126,7 @@ func defaultConfig() Config {
 	cfg.Workers.SubmitRetryMin = 15 * time.Second
 	cfg.Workers.SubmitRetryMax = 15 * time.Minute
 	cfg.Workers.RemovedRetention = 30 * 24 * time.Hour
+	cfg.Workers.RemoteAbsenceAttempts = 5
 	cfg.Workers.BatchSize = 25
 	cfg.applyDerived()
 	return cfg
@@ -176,6 +178,11 @@ func applyEnv(cfg *Config) {
 			cfg.UpstreamRemove = parsed
 		}
 	}
+	if v := strings.TrimSpace(os.Getenv("TORBOXARR_REMOTE_ABSENCE_ATTEMPTS")); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil {
+			cfg.Workers.RemoteAbsenceAttempts = parsed
+		}
+	}
 }
 
 func (c *Config) Validate() error {
@@ -194,6 +201,9 @@ func (c *Config) Validate() error {
 		return errors.New("data.completed is required")
 	case c.Auth.QBitUsername == "":
 		return errors.New("auth.qbit_username is required")
+	}
+	if c.Workers.RemoteAbsenceAttempts < 1 {
+		return errors.New("workers.remote_absence_attempts must be positive")
 	}
 	if err := validateSecret("torbox.api_token", c.TorBox.APIToken); err != nil {
 		return err
