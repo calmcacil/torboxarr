@@ -130,7 +130,9 @@ func defaultConfig() Config {
 	cfg.Workers.SubmitRetryMax = 15 * time.Minute
 	cfg.Workers.RemovedRetention = 30 * 24 * time.Hour
 	cfg.Workers.RemoteAbsenceAttempts = 5
-	cfg.Workers.QueuedForceStartAfter = 3 * time.Hour
+	// Automatic force-start is opt-in because it sends a state-changing request
+	// to TorBox. Operators can enable it with a positive duration.
+	cfg.Workers.QueuedForceStartAfter = 0
 	cfg.Workers.BatchSize = 25
 	cfg.applyDerived()
 	return cfg
@@ -218,7 +220,7 @@ func (c *Config) Validate() error {
 		return errors.New("workers.remote_absence_attempts must be positive")
 	}
 	if c.Workers.QueuedForceStartAfter < 0 {
-		return errors.New("workers.queued_force_start_after must not be negative")
+		return errors.New("TORBOXARR_QUEUED_FORCE_START_AFTER must not be negative")
 	}
 	if err := validateSecret("torbox.api_token", c.TorBox.APIToken); err != nil {
 		return err

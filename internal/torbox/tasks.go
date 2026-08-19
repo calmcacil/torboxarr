@@ -249,11 +249,15 @@ func (c *HTTPClient) ForceStartQueuedTask(ctx context.Context, sourceType, queue
 		return fmt.Errorf("force start: queued id %q is not a non-negative numeric TorBox queue id", queuedID)
 	}
 	if err := c.wait(ctx, c.pollLimiter); err != nil {
-		return err
+		return fmt.Errorf("force start queued %s: %w", sourceType, err)
 	}
 	body := fmt.Sprintf(`{"queued_id":%d,"operation":"start"}`, id)
-	if _, err := c.do(ctx, http.MethodPost, "/api/queued/controlqueued", strings.NewReader(body), "application/json", true); err != nil {
+	env, err := c.do(ctx, http.MethodPost, "/api/queued/controlqueued", strings.NewReader(body), "application/json", true)
+	if err != nil {
 		return fmt.Errorf("force start queued %s: %w", sourceType, err)
+	}
+	if env == nil || !env.Success {
+		return fmt.Errorf("force start queued %s: torbox returned an unsuccessful response", sourceType)
 	}
 	return nil
 }

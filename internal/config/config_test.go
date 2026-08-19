@@ -116,6 +116,14 @@ func TestDefaultConfigKeepsTorBoxCreateHourlyLimit(t *testing.T) {
 	}
 }
 
+func TestDefaultConfigDisablesQueuedForceStart(t *testing.T) {
+	cfg := defaultConfig()
+
+	if cfg.Workers.QueuedForceStartAfter != 0 {
+		t.Fatalf("QueuedForceStartAfter = %s, want disabled", cfg.Workers.QueuedForceStartAfter)
+	}
+}
+
 func TestApplyEnvReadsRemoteAbsenceAttempts(t *testing.T) {
 	cfg := defaultConfig()
 	t.Setenv("TORBOXARR_REMOTE_ABSENCE_ATTEMPTS", "9")
@@ -151,7 +159,8 @@ func TestApplyEnvRejectsInvalidQueuedForceStartDuration(t *testing.T) {
 func TestValidateRejectsNegativeQueuedForceStartDuration(t *testing.T) {
 	cfg := defaultConfig()
 	cfg.Workers.QueuedForceStartAfter = -time.Second
-	if err := cfg.Validate(); err == nil {
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "TORBOXARR_QUEUED_FORCE_START_AFTER") {
 		t.Fatal("expected negative force-start duration validation error")
 	}
 }

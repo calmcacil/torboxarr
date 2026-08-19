@@ -327,16 +327,16 @@ coordination overhead. Implement follow-up alignment sequentially on
 `feat/auto-force-start-queued`, then run HTTP, worker, store, configuration, and
 full-suite validation from the same checkout.
 
-## Current Gaps
+## Alignment Notes
 
-- Configuration currently defaults to `3h`; it must default to disabled.
-- README and `.env.example` currently describe `3h` as the default rather than
-  an opt-in example.
-- HTTP contract coverage is torrent-focused and should exercise a Usenet caller.
-- Worker coverage does not reconstruct the orchestrator/store to prove accepted
-  metadata survives restart.
-- Timestamp fallback tests do not cover malformed and future queue timestamps.
-- There is no focused test for an eligible hash-confirmed entry lacking a queue
-  control ID.
-- Diagnostics rely on metadata but the operator inspection path is not
-  documented.
+- The policy default is disabled; a positive
+  `TORBOXARR_QUEUED_FORCE_START_AFTER` value opts into automatic requests.
+- The HTTP contract is covered for torrent and NZB callers and rejects
+  unsuccessful response envelopes.
+- Queue matches authorize force-start only with the concrete queue ID returned
+  by the current successful lookup; hash-only matches remain queued without a
+  control request.
+- Historical queue recovery initializes `QueuedAt` from a valid queue
+  timestamp or recovery observation rather than the local job creation time.
+- The three lifecycle timestamps round-trip through `metadata_json` and are
+  documented in the README for operator inspection.

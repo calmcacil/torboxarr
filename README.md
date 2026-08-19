@@ -62,9 +62,16 @@ Optional overrides:
 | `TORBOXARR_DATABASE_PATH` | `/config/torboxarr.db` | SQLite database path; the container stores state under `/config` |
 | `TORBOXARR_LOG_LEVEL` | `INFO` | Log verbosity: DEBUG, INFO, WARN, or ERROR |
 | `TORBOXARR_REMOTE_ABSENCE_ATTEMPTS` | `5` | Successful queue/active absence checks before a remote job is marked failed |
-| `TORBOXARR_QUEUED_FORCE_START_AFTER` | `3h` | Automatically asks TorBox to force-start a confirmed queued job after this duration; set to `0` to disable |
+| `TORBOXARR_QUEUED_FORCE_START_AFTER` | disabled | Opt-in automatic force-start for a confirmed queued job; set a positive duration such as `3h` to enable, or `0` to disable |
 | `TORBOXARR_SAB_NZB_KEY` | falls back to `TORBOXARR_SAB_API_KEY` | Explicit key for the SABnzbd-compatible endpoint; omit it to reuse the SAB API key |
 | `TORBOXARR_UPSTREAM_REMOVE` | `false` | When true, removing a download also deletes the matching task from TorBox's servers, so cached entries don't accumulate there |
+
+Automatic queued force-start is disabled unless `TORBOXARR_QUEUED_FORCE_START_AFTER`
+is set to a positive duration such as `3h`. The setting is evaluated against the
+current confirmed queue lifecycle and does not change a job's Arr-visible state.
+For database diagnostics, the job's `metadata_json` records `queued_at`,
+`force_start_last_attempt_at`, and `force_start_accepted_at`; a non-null accepted
+timestamp means TorBox accepted the control request for that queue lifecycle.
 
 Docker-specific runtime variables used by the bundled compose file. Set these to the same UID/GID that Sonarr and Radarr use on the host, so TorBoxarr can write to the same download and category folders:
 

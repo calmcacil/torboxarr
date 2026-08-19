@@ -119,6 +119,35 @@ func TestUpdateJob(t *testing.T) {
 	}
 }
 
+func TestJobMetadataRoundTripsForceStartTimestamps(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	queuedAt := time.Date(2026, 8, 19, 12, 0, 0, 123456789, time.UTC)
+	attemptedAt := queuedAt.Add(3 * time.Hour)
+	acceptedAt := attemptedAt.Add(time.Second)
+	job := makeJob("metadata-force-start", "pub-metadata-force-start", store.StateRemoteQueued)
+	job.Metadata.QueuedAt = &queuedAt
+	job.Metadata.ForceStartLastAttemptAt = &attemptedAt
+	job.Metadata.ForceStartAcceptedAt = &acceptedAt
+	if err := st.CreateJob(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := st.GetJobByID(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, pair := range map[string][2]*time.Time{
+		"queued":   {&queuedAt, got.Metadata.QueuedAt},
+		"attempt":  {&attemptedAt, got.Metadata.ForceStartLastAttemptAt},
+		"accepted": {&acceptedAt, got.Metadata.ForceStartAcceptedAt},
+	} {
+		if pair[1] == nil || !pair[1].Equal(*pair[0]) {
+			t.Errorf("%s timestamp = %v, want %v", name, pair[1], pair[0])
+		}
+	}
+}
+
 // ─── UpdateJobState ──────────────────────────────────────────────────────────
 
 func TestUpdateJobState(t *testing.T) {

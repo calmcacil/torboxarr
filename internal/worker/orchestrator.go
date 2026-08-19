@@ -173,20 +173,19 @@ func (o *Orchestrator) recoverFailedQueuedJobs(ctx context.Context) error {
 		}
 		queued, queueErr := o.torbox.FindQueuedTask(ctx, string(job.SourceType), deref(job.QueuedID), deref(job.QueueAuthID), deref(job.RemoteHash))
 		if queueErr == nil && queued != nil {
+			now := time.Now().UTC()
+			o.prepareQueuedMetadata(job, queued, now)
 			job.ErrorMessage = nil
 			job.Metadata.PollAttempts = 0
 			job.NextRunAt = nil
 			job.RemoteID = nil
-			if queued.QueuedID != "" {
-				job.QueuedID = ptr(queued.QueuedID)
-			}
 			if queued.Hash != "" {
 				job.RemoteHash = ptr(queued.Hash)
 			}
 			if queued.QueueAuthID != "" {
 				job.QueueAuthID = ptr(queued.QueueAuthID)
 			}
-			job.UpdatedAt = time.Now().UTC()
+			job.UpdatedAt = now
 			ok, err := o.store.UpdateJobStateIfCurrent(ctx, job, store.StateRemoteFailed, store.StateRemoteQueued, "startup recovery found task in TorBox queue")
 			if err != nil {
 				return err

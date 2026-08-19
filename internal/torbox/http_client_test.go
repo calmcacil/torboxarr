@@ -14,24 +14,41 @@ import (
 	"github.com/mrjoiny/torboxarr/internal/torbox"
 )
 
-func TestForceStartQueuedTask(t *testing.T) {
-	client, _ := newTestHTTPClient(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || r.URL.Path != "/api/queued/controlqueued" {
-			t.Fatalf("request = %s %s", r.Method, r.URL.Path)
-		}
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			t.Fatal(err)
-		}
-		want := []byte(`{"queued_id":42,"operation":"start"}`)
-		if !bytes.Equal(body, want) {
-			t.Fatalf("body = %s, want %s", body, want)
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write(jsonEnvelope(nil))
-	})
-	if err := client.ForceStartQueuedTask(t.Context(), "torrent", "42"); err != nil {
-		t.Fatal(err)
+func TestForceStartQueuedTaskContract(t *testing.T) {
+	for _, sourceType := range []string{"torrent", "nzb"} {
+		t.Run(sourceType, func(t *testing.T) {
+			client, _ := newTestHTTPClient(t, func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPost || r.URL.Path != "/api/queued/controlqueued" {
+					t.Fatalf("request = %s %s", r.Method, r.URL.Path)
+				}
+				if got := r.Header.Get("Content-Type"); got != "application/json" {
+					t.Fatalf("Content-Type = %q, want application/json", got)
+				}
+				body, err := io.ReadAll(r.Body)
+				if err != nil {
+					t.Fatal(err)
+				}
+				want := []byte(`{"queued_id":42,"operation":"start"}`)
+				if !bytes.Equal(body, want) {
+					t.Fatalf("body = %s, want %s", body, want)
+				}
+				var decoded map[string]any
+				if err := json.Unmarshal(body, &decoded); err != nil {
+					t.Fatal(err)
+				}
+				if _, exists := decoded["all"]; exists {
+					t.Fatal("request must not contain account-wide all operation")
+				}
+				if got, ok := decoded["queued_id"].(float64); !ok || got != 42 {
+					t.Fatalf("queued_id = %#v, want numeric 42", decoded["queued_id"])
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write(jsonEnvelope(nil))
+			})
+			if err := client.ForceStartQueuedTask(t.Context(), sourceType, "42"); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 
@@ -44,6 +61,15 @@ func TestForceStartQueuedTaskRejectsNonNumericID(t *testing.T) {
 	}
 }
 
+func TestForceStartQueuedTaskRejectsEmptyID(t *testing.T) {
+	client, _ := newTestHTTPClient(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("request must not be made")
+	})
+	if err := client.ForceStartQueuedTask(t.Context(), "torrent", " "); err == nil {
+		t.Fatal("expected empty queue ID error")
+	}
+}
+
 func TestForceStartQueuedTaskPropagatesAPIError(t *testing.T) {
 	client, _ := newTestHTTPClient(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -52,6 +78,16 @@ func TestForceStartQueuedTaskPropagatesAPIError(t *testing.T) {
 	})
 	if err := client.ForceStartQueuedTask(t.Context(), "torrent", "42"); err == nil {
 		t.Fatal("expected force-start API error")
+	}
+}
+
+func TestForceStartQueuedTaskRejectsUnsuccessfulEnvelope(t *testing.T) {
+	client, _ := newTestHTTPClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"success":false}`))
+	})
+	if err := client.ForceStartQueuedTask(t.Context(), "torrent", "42"); err == nil {
+		t.Fatal("expected unsuccessful envelope error")
 	}
 }
 
@@ -70,6 +106,24 @@ func TestQueuedStatusParsesCreationTimestamp(t *testing.T) {
 	}
 	if status.QueueCreatedAt == nil || !status.QueueCreatedAt.Equal(time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)) {
 		t.Fatalf("QueueCreatedAt = %v", status.QueueCreatedAt)
+	}
+}
+
+func TestQueuedStatusIgnoresMalformedCreationTimestamp(t *testing.T) {
+	client, _ := newTestHTTPClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(jsonEnvelope([]map[string]any{{
+			"id":         42,
+			"created_at": "not-a-timestamp",
+			"hash":       "queued-hash",
+		}}))
+	})
+	status, err := client.FindQueuedTask(t.Context(), "torrent", "42", "", "queued-hash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.QueueCreatedAt != nil {
+		t.Fatalf("QueueCreatedAt = %v, want nil for malformed timestamp", status.QueueCreatedAt)
 	}
 }
 

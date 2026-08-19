@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -144,22 +145,44 @@ func (o *Orchestrator) keepQueued(ctx context.Context, job *store.Job, status *t
 	if status.Name != "" {
 		job.DisplayName = status.Name
 	}
-	o.maybeForceStartQueued(ctx, job, now)
-	nextRun := now.Add(withJitter(o.cfg.Workers.PollInterval))
+	retryAt := o.maybeForceStartQueued(ctx, job, status, now)
+	nextRun := time.Now().UTC().Add(withJitter(o.cfg.Workers.PollInterval))
+	if !retryAt.IsZero() {
+		nextRun = retryAt
+	}
 	job.NextRunAt = &nextRun
 	job.UpdatedAt = now
-	o.log.Info("remote task still queued",
+	o.log.Debug("remote task still queued",
 		"job_id", job.ID,
 		"public_id", job.PublicID,
 		"queued_id", deref(job.QueuedID),
 		"queue_state", status.State,
 		"next_run_at", nextRun.Format(time.RFC3339Nano),
 	)
-	_, err := o.store.UpdateJobIfState(ctx, job, store.StateRemoteQueued)
-	return err
+	ok, err := o.store.UpdateJobIfState(ctx, job, store.StateRemoteQueued)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		o.log.Warn("queued poll update ignored because local state changed",
+			"job_id", job.ID,
+			"public_id", job.PublicID,
+			"queued_id", deref(job.QueuedID),
+		)
+	}
+	return nil
 }
 
 func (o *Orchestrator) restoreQueued(ctx context.Context, job *store.Job, status *torbox.TaskStatus) error {
+	// A queue match after an active state is a new lifecycle unless the concrete
+	// queue ID proves that the prior lifecycle continued uninterrupted.
+	previousID := strings.TrimSpace(deref(job.QueuedID))
+	nextID := strings.TrimSpace(status.QueuedID)
+	if job.State == store.StateRemoteActive && (previousID == "" || nextID == "" || previousID != nextID) {
+		job.Metadata.QueuedAt = nil
+		job.Metadata.ForceStartLastAttemptAt = nil
+		job.Metadata.ForceStartAcceptedAt = nil
+	}
 	o.prepareQueuedMetadata(job, status, time.Now().UTC())
 	job.Metadata.PollAttempts = 0
 	job.ErrorMessage = nil
@@ -180,8 +203,18 @@ func (o *Orchestrator) restoreQueued(ctx context.Context, job *store.Job, status
 	job.NextRunAt = &nextRun
 	job.UpdatedAt = time.Now().UTC()
 	if job.State == store.StateRemoteQueued {
-		_, err := o.store.UpdateJobIfState(ctx, job, store.StateRemoteQueued)
-		return err
+		ok, err := o.store.UpdateJobIfState(ctx, job, store.StateRemoteQueued)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			o.log.Warn("queued restoration ignored because local state changed",
+				"job_id", job.ID,
+				"public_id", job.PublicID,
+				"queued_id", deref(job.QueuedID),
+			)
+		}
+		return nil
 	}
 	ok, err := o.store.UpdateJobStateIfCurrent(ctx, job, store.StateRemoteActive, store.StateRemoteQueued, "active lookup recovered queued task")
 	if err != nil || !ok {
@@ -192,7 +225,7 @@ func (o *Orchestrator) restoreQueued(ctx context.Context, job *store.Job, status
 }
 
 func (o *Orchestrator) prepareQueuedMetadata(job *store.Job, status *torbox.TaskStatus, now time.Time) {
-	previousID := deref(job.QueuedID)
+	previousID := strings.TrimSpace(deref(job.QueuedID))
 	nextID := strings.TrimSpace(status.QueuedID)
 	if previousID != "" && nextID != "" && previousID != nextID {
 		job.Metadata.QueuedAt = nil
@@ -202,27 +235,63 @@ func (o *Orchestrator) prepareQueuedMetadata(job *store.Job, status *torbox.Task
 	if nextID != "" {
 		job.QueuedID = ptr(nextID)
 	}
-	if job.Metadata.QueuedAt != nil {
-		return
-	}
-	queuedAt := now
+	// Prefer the earliest trustworthy timestamp for this queue identity. A
+	// submission records local acceptance first, while the queue response may
+	// later provide an earlier server-side creation time.
 	if status.QueueCreatedAt != nil && !status.QueueCreatedAt.After(now) {
-		queuedAt = status.QueueCreatedAt.UTC()
+		queuedAt := status.QueueCreatedAt.UTC()
+		if job.Metadata.QueuedAt == nil || queuedAt.Before(job.Metadata.QueuedAt.UTC()) {
+			job.Metadata.QueuedAt = &queuedAt
+		}
 	}
-	job.Metadata.QueuedAt = &queuedAt
+	if job.Metadata.QueuedAt == nil {
+		queuedAt := now
+		job.Metadata.QueuedAt = &queuedAt
+	}
 }
 
-func (o *Orchestrator) maybeForceStartQueued(ctx context.Context, job *store.Job, now time.Time) {
+func (o *Orchestrator) maybeForceStartQueued(ctx context.Context, job *store.Job, status *torbox.TaskStatus, now time.Time) time.Time {
 	threshold := o.cfg.Workers.QueuedForceStartAfter
 	if threshold <= 0 || job.Metadata.ForceStartAcceptedAt != nil {
-		return
+		return time.Time{}
 	}
-	queuedID := strings.TrimSpace(deref(job.QueuedID))
-	if queuedID == "" || job.Metadata.QueuedAt == nil || now.Before(job.Metadata.QueuedAt.Add(threshold)) {
-		return
+	if job.Metadata.QueuedAt == nil || now.Before(job.Metadata.QueuedAt.Add(threshold)) {
+		return time.Time{}
+	}
+	if job.DeleteRequested {
+		o.log.Warn("force start skipped because removal was requested",
+			"job_id", job.ID,
+			"public_id", job.PublicID,
+			"source_type", job.SourceType,
+			"queued_id", deref(job.QueuedID),
+		)
+		return time.Time{}
+	}
+	if !supportsForceStart(job.SourceType) {
+		o.log.Warn("force start skipped because source type is unsupported",
+			"job_id", job.ID,
+			"public_id", job.PublicID,
+			"source_type", job.SourceType,
+			"queued_id", deref(job.QueuedID),
+		)
+		return time.Time{}
+	}
+	// Only the identifier returned by this successful queue lookup can authorize
+	// a control request. Do not reuse a stale job identifier for hash matches.
+	queuedID := strings.TrimSpace(status.QueuedID)
+	if queuedID == "" || !isNumericQueueID(queuedID) {
+		o.log.Warn("force start skipped because no usable queue id is available",
+			"job_id", job.ID,
+			"public_id", job.PublicID,
+			"source_type", job.SourceType,
+			"queued_id", queuedID,
+			"queue_age", now.Sub(*job.Metadata.QueuedAt).String(),
+			"threshold", threshold.String(),
+		)
+		return time.Time{}
 	}
 	if job.Metadata.ForceStartLastAttemptAt != nil && now.Before(job.Metadata.ForceStartLastAttemptAt.Add(o.cfg.Workers.PollInterval)) {
-		return
+		return time.Time{}
 	}
 
 	o.log.Info("queued job eligible for force start",
@@ -235,14 +304,16 @@ func (o *Orchestrator) maybeForceStartQueued(ctx context.Context, job *store.Job
 	)
 	job.Metadata.ForceStartLastAttemptAt = &now
 	if err := o.torbox.ForceStartQueuedTask(ctx, string(job.SourceType), queuedID); err != nil {
+		nextRetry := time.Now().UTC().Add(withJitter(o.cfg.Workers.PollInterval))
 		o.log.Warn("force start queued job failed; will retry",
 			"job_id", job.ID,
 			"public_id", job.PublicID,
 			"source_type", job.SourceType,
 			"queued_id", queuedID,
+			"next_retry_at", nextRetry.Format(time.RFC3339Nano),
 			"error", err,
 		)
-		return
+		return nextRetry
 	}
 	job.Metadata.ForceStartAcceptedAt = &now
 	o.log.Info("force start queued job accepted",
@@ -251,6 +322,21 @@ func (o *Orchestrator) maybeForceStartQueued(ctx context.Context, job *store.Job
 		"source_type", job.SourceType,
 		"queued_id", queuedID,
 	)
+	return time.Time{}
+}
+
+func supportsForceStart(sourceType store.SourceType) bool {
+	switch sourceType {
+	case store.SourceTypeTorrent, store.SourceTypeNZB:
+		return true
+	default:
+		return false
+	}
+}
+
+func isNumericQueueID(value string) bool {
+	id, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+	return err == nil && id >= 0
 }
 
 func (o *Orchestrator) applyActiveStatus(ctx context.Context, job *store.Job, status *torbox.TaskStatus) error {
@@ -292,6 +378,15 @@ func (o *Orchestrator) applyActiveStatus(ctx context.Context, job *store.Job, st
 		ok, err := o.store.UpdateJobStateIfCurrent(ctx, job, store.StateRemoteQueued, store.StateRemoteActive, "active task discovered after queue lookup")
 		if err != nil || !ok {
 			return err
+		}
+		if job.Metadata.ForceStartAcceptedAt != nil {
+			o.log.Info("force-started queued job promoted to active",
+				"job_id", job.ID,
+				"public_id", job.PublicID,
+				"source_type", job.SourceType,
+				"queued_id", deref(job.QueuedID),
+				"remote_id", status.RemoteID,
+			)
 		}
 	}
 	o.log.Debug("remote job status",
