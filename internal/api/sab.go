@@ -15,6 +15,8 @@ import (
 )
 
 func (s *Server) handleSABAPI(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, compat.MaxSABUploadBytes)
+
 	// Extract mode and apikey from query parameters (no body parsing needed).
 	q := r.URL.Query()
 	mode := strings.ToLower(strings.TrimSpace(q.Get("mode")))
@@ -47,7 +49,7 @@ func (s *Server) handleSABAPI(w http.ResponseWriter, r *http.Request) {
 	switch mode {
 	case "addurl", "addfile", "queue", "history", "set_config":
 		if strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/") {
-			if err := r.ParseMultipartForm(2 << 20); err != nil { // 2 MB; NZBs are typically < 100 KB
+			if err := r.ParseMultipartForm(2 << 20); err != nil {
 				writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid multipart body"})
 				return
 			}

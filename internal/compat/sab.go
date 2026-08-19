@@ -8,6 +8,9 @@ import (
 	"github.com/mrjoiny/torboxarr/internal/store"
 )
 
+// MaxSABUploadBytes bounds the complete request body accepted by the local SAB API.
+const MaxSABUploadBytes = 256 << 20
+
 type SABAddResponse struct {
 	Status bool     `json:"status"`
 	NzoIDs []string `json:"nzo_ids"`

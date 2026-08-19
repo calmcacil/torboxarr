@@ -102,8 +102,8 @@ therefore must be visible inside the container.
 
 14. An NZB path must identify an existing, non-empty regular file. The command
     rejects an input that is not parseable as XML with an NZB document root. It
-    applies the local SAB-compatible endpoint's upload-size limit before making
-    the request.
+    applies the local SAB-compatible endpoint's 256 MiB complete-request upload
+    limit before making the request.
 
 15. Torrent and NZB files are uploaded under their base filename. The command
     does not send a rename, password, custom save path, tags, paused state,

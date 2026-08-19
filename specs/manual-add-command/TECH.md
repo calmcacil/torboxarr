@@ -4,13 +4,11 @@
 
 The product behavior is defined in [`PRODUCT.md`](./PRODUCT.md).
 
-The current `cmd/torboxarr/add.go` implements container-local magnet and torrent
-file submission through the qBittorrent-compatible API. It validates command
-arguments and files, logs in with `TORBOXARR_QBIT_PASSWORD`, verifies the
-category, submits one item, and distinguishes uncertain submission timeouts.
-
-The implementation does not yet satisfy the complete product contract because
-it has no `--nzb` input or SABnzbd-compatible client path.
+The current `cmd/torboxarr/add.go` implements container-local magnet, torrent
+file, and NZB file submission through the qBittorrent- and SABnzbd-compatible
+APIs. It validates command arguments and files, verifies the corresponding
+category, submits one item, and distinguishes definitive and uncertain
+outcomes.
 
 ## Command Dispatch
 
@@ -100,16 +98,17 @@ the query for multipart requests so authentication occurs before multipart
 parsing. Error messages must never include the request URL because it contains
 the API key.
 
-The local endpoint currently parses multipart uploads with a 2 MiB memory
-threshold, not a strict request-size cap. Product behavior requires an explicit
-upload limit. Before implementation, align the command and server on one
-documented maximum using `http.MaxBytesReader` server-side; use that same value
-for local validation. Do not claim that `ParseMultipartForm(2 << 20)` itself
-enforces a 2 MiB maximum because larger bodies may spill to disk.
+The local endpoint parses multipart uploads with a 2 MiB memory threshold, not a
+strict request-size cap. Product behavior requires a 256 MiB complete-request
+upload limit. The server wraps accepted request bodies with
+`http.MaxBytesReader`, and the command validates the source and constructed
+request against the same limit. `ParseMultipartForm(2 << 20)` remains only the
+memory threshold; it does not itself enforce the 256 MiB maximum because larger
+bodies may spill to disk.
 
 ### NZB Validation
 
-Require an existing, non-empty regular file within the agreed upload limit.
+Require an existing, non-empty regular file within the 256 MiB upload limit.
 Use a streaming XML decoder and require:
 
 - well-formed XML;
@@ -238,19 +237,13 @@ go test -race -count=1 -p 1 -parallel=1 ./...
 
 ## Current Gaps
 
-- `--nzb` is not implemented.
-- The command has no SAB category lookup, authentication, upload, or response
-  handling.
-- There is no shared explicit NZB upload-size limit enforced by both the server
-  and command.
-- Existing tests cover the torrent path with mock HTTP handlers but do not run
-  the command client against the real TorBoxarr router and store.
+- No known implementation gaps remain for the specified command flows.
 
-## Implementation Sequence
+## Implementation Status
 
-1. Establish and enforce the SAB upload-size limit in the server.
-2. Add `--nzb` argument and streaming NZB validation.
-3. Add SAB category lookup and single-file submission.
-4. Refactor only enough common HTTP/result handling to keep torrent and NZB
-   behavior consistent.
-5. Add real-router integration coverage, then run the full validation suite.
+- The server and command share and enforce the 256 MiB SAB request limit.
+- The command validates and submits magnets, torrent files, and NZB files.
+- SAB category lookup, authentication, upload handling, response validation, and
+  uncertain-outcome reporting are implemented.
+- Real-router integration coverage verifies all three source types, persisted
+  payloads, source metadata, and duplicate handling.

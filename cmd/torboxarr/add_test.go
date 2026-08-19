@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"io"
+	"log/slog"
 	"mime"
 	"mime/multipart"
 	"net/http"
@@ -16,6 +18,12 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/mrjoiny/torboxarr/internal/api"
+	"github.com/mrjoiny/torboxarr/internal/auth"
+	"github.com/mrjoiny/torboxarr/internal/config"
+	"github.com/mrjoiny/torboxarr/internal/files"
+	"github.com/mrjoiny/torboxarr/internal/store"
 )
 
 type addServerOptions struct {
@@ -68,6 +76,111 @@ func defaultAddServerOptions() addServerOptions {
 		addStatus:        http.StatusOK,
 		addBody:          "Ok.",
 	}
+}
+
+type sabAddServerOptions struct {
+	configStatus int
+	configBody   string
+	addStatus    int
+	addBody      string
+	addDelay     time.Duration
+}
+
+type sabAddRequestRecord struct {
+	method      string
+	query       url.Values
+	contentType string
+	form        map[string]string
+	fileName    string
+	fileContent []byte
+}
+
+type sabAddServer struct {
+	mu    sync.Mutex
+	paths []string
+	adds  []sabAddRequestRecord
+}
+
+func (s *sabAddServer) record(path string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.paths = append(s.paths, path)
+}
+
+func (s *sabAddServer) recordAdd(add sabAddRequestRecord) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.adds = append(s.adds, add)
+}
+
+func (s *sabAddServer) snapshot() ([]string, []sabAddRequestRecord) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Clone(s.paths), slices.Clone(s.adds)
+}
+
+func defaultSABAddServerOptions() sabAddServerOptions {
+	return sabAddServerOptions{
+		configStatus: http.StatusOK,
+		configBody:   `{"config":{"categories":[{"name":"tv"},{"name":"radarr"}]}}`,
+		addStatus:    http.StatusOK,
+		addBody:      `{"status":true,"nzo_ids":["TBOX-nzo-123"]}`,
+	}
+}
+
+func newSABAddServer(t *testing.T, opts sabAddServerOptions) (*httptest.Server, *sabAddServer) {
+	t.Helper()
+	server := &sabAddServer{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		server.record(r.URL.Path)
+		if r.URL.Path != "/sabnzbd/api" {
+			http.NotFound(w, r)
+			return
+		}
+		switch r.URL.Query().Get("mode") {
+		case "get_config":
+			w.WriteHeader(opts.configStatus)
+			_, _ = w.Write([]byte(opts.configBody))
+		case "addfile":
+			if opts.addDelay > 0 {
+				select {
+				case <-time.After(opts.addDelay):
+				case <-r.Context().Done():
+				}
+			}
+			record := sabAddRequestRecord{
+				method:      r.Method,
+				query:       r.URL.Query(),
+				contentType: r.Header.Get("Content-Type"),
+				form:        map[string]string{},
+			}
+			if err := r.ParseMultipartForm(2 << 20); err == nil && r.MultipartForm != nil {
+				for key, values := range r.MultipartForm.Value {
+					if len(values) > 0 {
+						record.form[key] = values[0]
+					}
+				}
+				for _, headers := range r.MultipartForm.File {
+					for _, header := range headers {
+						file, err := header.Open()
+						if err != nil {
+							continue
+						}
+						record.fileName = header.Filename
+						record.fileContent, _ = io.ReadAll(file)
+						file.Close()
+					}
+				}
+			}
+			server.recordAdd(record)
+			w.WriteHeader(opts.addStatus)
+			_, _ = w.Write([]byte(opts.addBody))
+		default:
+			http.Error(w, "unsupported mode", http.StatusBadRequest)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv, server
 }
 
 func newAddServer(t *testing.T, opts addServerOptions) (*httptest.Server, *addServer) {
@@ -194,7 +307,7 @@ func TestRunAdd_RequiresCategory(t *testing.T) {
 
 func TestRunAdd_RequiresMagnetOrTorrent(t *testing.T) {
 	err := runAdd(context.Background(), "sonarr", "", "")
-	if err == nil || !strings.Contains(err.Error(), "exactly one of --magnet or --torrent") {
+	if err == nil || !strings.Contains(err.Error(), "exactly one of --magnet, --torrent, or --nzb") {
 		t.Fatalf("expected magnet/torrent required error, got %v", err)
 	}
 }
@@ -508,5 +621,329 @@ func TestIsValidTorrent(t *testing.T) {
 		if isValidTorrent([]byte(data)) {
 			t.Errorf("data %q: expected invalid torrent", data)
 		}
+	}
+}
+
+func writeTempNZB(t *testing.T, content string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "sample.nzb")
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func withSABAPIKey(t *testing.T) {
+	t.Helper()
+	t.Setenv("TORBOXARR_SAB_API_KEY", "sab-secret")
+}
+
+func TestRunAddCommand_RejectsMixedSources(t *testing.T) {
+	args := []string{
+		"--category", "tv",
+		"--magnet", "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567",
+		"--nzb", "/tmp/sample.nzb",
+	}
+	err := runAddCommand(context.Background(), args)
+	if err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Fatalf("expected mixed-source error, got %v", err)
+	}
+}
+
+func TestValidateNZBFile(t *testing.T) {
+	valid := []string{
+		`<?xml version="1.0"?><nzb></nzb>`,
+		`<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb"><file/></nzb>`,
+	}
+	for _, content := range valid {
+		path := writeTempNZB(t, content)
+		if err := validateNZBFile(path); err != nil {
+			t.Errorf("content %q: unexpected error %v", content, err)
+		}
+	}
+
+	invalid := []string{
+		"",
+		"<rss></rss>",
+		"<nzb>",
+		"<nzb></nzb>trailing",
+		"<nzb></nzb><nzb></nzb>",
+		"prefix<nzb></nzb>",
+	}
+	for _, content := range invalid {
+		path := writeTempNZB(t, content)
+		if err := validateNZBFile(path); err == nil {
+			t.Errorf("content %q: expected validation error", content)
+		}
+	}
+}
+
+func TestValidateNZBFile_RejectsOversizedFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "large.nzb")
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Truncate(maxNZBFileBytes + 1); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	err = validateNZBFile(path)
+	if err == nil || !strings.Contains(err.Error(), "too large") {
+		t.Fatalf("expected oversized NZB error, got %v", err)
+	}
+}
+
+func TestRunAddNZB_MissingAPIKeyBeforeNetwork(t *testing.T) {
+	t.Setenv("TORBOXARR_SAB_API_KEY", "")
+	srv, server := newSABAddServer(t, defaultSABAddServerOptions())
+	path := writeTempNZB(t, `<nzb></nzb>`)
+
+	err := runAddInputAt(context.Background(), srv.URL, addInput{Category: "tv", NZBPath: path})
+	if err == nil || !strings.Contains(err.Error(), "TORBOXARR_SAB_API_KEY") {
+		t.Fatalf("expected API key error, got %v", err)
+	}
+	paths, _ := server.snapshot()
+	if len(paths) != 0 {
+		t.Fatalf("expected no network requests, got %v", paths)
+	}
+}
+
+func TestRunAddNZB_Success(t *testing.T) {
+	srv, server := newSABAddServer(t, defaultSABAddServerOptions())
+	withSABAPIKey(t)
+	path := writeTempNZB(t, `<nzb xmlns="urn:test"><file/></nzb>`)
+
+	output := captureOutput(t, func() {
+		if err := runAddInputAt(context.Background(), srv.URL, addInput{Category: "tv", NZBPath: path}); err != nil {
+			t.Fatalf("expected success, got %v", err)
+		}
+	})
+	if strings.Contains(output, "sab-secret") || !strings.Contains(output, "submitted NZB file") || !strings.Contains(output, filepath.Base(path)) || !strings.Contains(output, "TBOX-nzo-123") {
+		t.Fatalf("confirmation = %q, want non-secret NZB confirmation", output)
+	}
+
+	paths, adds := server.snapshot()
+	if !slices.Equal(paths, []string{"/sabnzbd/api", "/sabnzbd/api"}) {
+		t.Errorf("request paths = %v, want category lookup then upload", paths)
+	}
+	if len(adds) != 1 {
+		t.Fatalf("expected one add request, got %d", len(adds))
+	}
+	add := adds[0]
+	if add.method != http.MethodPost || add.query.Get("mode") != "addfile" || add.query.Get("apikey") != "sab-secret" {
+		t.Errorf("upload request = method %q query %v, want POST addfile with API key", add.method, add.query)
+	}
+	if add.form["mode"] != "addfile" || add.form["output"] != "json" || add.form["cat"] != "tv" {
+		t.Errorf("upload fields = %v, want addfile/json/tv", add.form)
+	}
+	if add.fileName != filepath.Base(path) || string(add.fileContent) != `<nzb xmlns="urn:test"><file/></nzb>` {
+		t.Errorf("upload file = %q %q, want base filename and intact content", add.fileName, add.fileContent)
+	}
+}
+
+func TestRunAddNZB_UnknownCategoryDoesNotUpload(t *testing.T) {
+	srv, server := newSABAddServer(t, defaultSABAddServerOptions())
+	withSABAPIKey(t)
+	path := writeTempNZB(t, `<nzb></nzb>`)
+
+	err := runAddInputAt(context.Background(), srv.URL, addInput{Category: "missing", NZBPath: path})
+	if err == nil || !strings.Contains(err.Error(), "unknown") {
+		t.Fatalf("expected unknown category error, got %v", err)
+	}
+	_, adds := server.snapshot()
+	if len(adds) != 0 {
+		t.Fatalf("expected no upload for unknown category, got %d", len(adds))
+	}
+}
+
+func TestRunAddNZB_RejectsUnacceptedResponse(t *testing.T) {
+	opts := defaultSABAddServerOptions()
+	opts.addBody = `{"status":false,"nzo_ids":[]}`
+	srv, _ := newSABAddServer(t, opts)
+	withSABAPIKey(t)
+	path := writeTempNZB(t, `<nzb></nzb>`)
+
+	err := runAddInputAt(context.Background(), srv.URL, addInput{Category: "tv", NZBPath: path})
+	if err == nil || !strings.Contains(err.Error(), "rejected") {
+		t.Fatalf("expected SAB rejection, got %v", err)
+	}
+}
+
+func TestRunAddNZB_TimeoutIsUnknown(t *testing.T) {
+	opts := defaultSABAddServerOptions()
+	opts.addDelay = 200 * time.Millisecond
+	srv, _ := newSABAddServer(t, opts)
+	path := writeTempNZB(t, `<nzb></nzb>`)
+	client := &sabAddClient{
+		http:    &http.Client{Timeout: 20 * time.Millisecond},
+		baseURL: srv.URL,
+		apiKey:  "sab-secret",
+	}
+
+	err := client.run(context.Background(), "tv", path)
+	if err == nil || !strings.Contains(err.Error(), "status is unknown") || !strings.Contains(strings.ToLower(err.Error()), "sab queue") {
+		t.Fatalf("expected uncertain SAB submission, got %v", err)
+	}
+}
+
+func newManualAddRouter(t *testing.T) (*httptest.Server, *store.Store) {
+	t.Helper()
+	ctx := context.Background()
+	db, err := store.Open(ctx, ":memory:", 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.SetMaxOpenConns(1)
+	if err := store.RunMigrationsFS(db, store.EmbeddedMigrations); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	st := store.New(db)
+	tmpDir := t.TempDir()
+	layout := files.NewLayout(tmpDir, filepath.Join(tmpDir, "staging"), filepath.Join(tmpDir, "completed"), filepath.Join(tmpDir, "payloads"))
+	if err := layout.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	var cfg config.Config
+	cfg.Server.Address = ":0"
+	cfg.Server.BaseURL = "http://localhost"
+	cfg.Data.Root = tmpDir
+	cfg.Data.Staging = filepath.Join(tmpDir, "staging")
+	cfg.Data.Completed = filepath.Join(tmpDir, "completed")
+	cfg.Data.Payloads = filepath.Join(tmpDir, "payloads")
+	cfg.Auth.QBitUsername = "admin"
+	cfg.Auth.QBitPassword = "password"
+	cfg.Auth.SABAPIKey = "sab-secret"
+	cfg.Auth.SABNZBKey = "sab-secret"
+	cfg.Auth.SessionTTL = 24 * time.Hour
+	cfg.Compatibility.QBitVersion = "5.0.0"
+	cfg.Compatibility.QBitWebAPI = "2.11.3"
+	cfg.Compatibility.SABVersion = "4.5.1"
+	cfg.Compatibility.DefaultCategory = "torboxarr"
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	qbitAuth := auth.NewQBitSessionManager(st, cfg.Auth.QBitUsername, cfg.Auth.QBitPassword, cfg.Auth.SessionTTL)
+	sabAuth := auth.NewSABAuth(cfg.Auth.SABAPIKey, cfg.Auth.SABNZBKey)
+	server := api.NewServer(&cfg, logger, st, layout, qbitAuth, sabAuth)
+	httpServer := httptest.NewServer(server.Router())
+	t.Cleanup(httpServer.Close)
+	return httpServer, st
+}
+
+func TestRunAddNZB_RealRouterPersistsPayload(t *testing.T) {
+	srv, st := newManualAddRouter(t)
+	withSABAPIKey(t)
+	path := writeTempNZB(t, `<nzb xmlns="urn:test"><file/></nzb>`)
+
+	if err := runAddInputAt(context.Background(), srv.URL, addInput{Category: "tv", NZBPath: path}); err != nil {
+		t.Fatalf("expected real-router success, got %v", err)
+	}
+
+	jobs, err := st.ListVisibleClientJobs(context.Background(), store.ClientKindSAB, "tv", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("got %d jobs, want 1", len(jobs))
+	}
+	job := jobs[0]
+	if job.SourceType != store.SourceTypeNZB || job.ClientKind != store.ClientKindSAB || job.Category != "tv" || job.PayloadRef == nil {
+		t.Fatalf("job = %+v, want SAB NZB with tv category and payload", job)
+	}
+	if job.Metadata.UploadedFilename != filepath.Base(path) || job.State != store.StateSubmitPending {
+		t.Fatalf("job metadata/state = %+v/%s, want uploaded filename and submit_pending", job.Metadata, job.State)
+	}
+	payload, err := os.ReadFile(*job.PayloadRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(payload, []byte(`<nzb xmlns="urn:test"><file/></nzb>`)) {
+		t.Fatalf("stored payload = %q, want original NZB", payload)
+	}
+
+	if err := runAddInputAt(context.Background(), srv.URL, addInput{Category: "tv", NZBPath: path}); err != nil {
+		t.Fatalf("expected duplicate submission response success, got %v", err)
+	}
+	jobs, err = st.ListVisibleClientJobs(context.Background(), store.ClientKindSAB, "tv", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("duplicate submission created %d jobs, want 1", len(jobs))
+	}
+}
+
+func TestRunAddMagnet_RealRouterPersistsJob(t *testing.T) {
+	srv, st := newManualAddRouter(t)
+	t.Setenv("TORBOXARR_QBIT_PASSWORD", "password")
+	magnet := "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=movie"
+
+	if err := runAddAt(context.Background(), srv.URL, "torboxarr", magnet, ""); err != nil {
+		t.Fatalf("expected real-router success, got %v", err)
+	}
+
+	jobs, err := st.ListVisibleClientJobs(context.Background(), store.ClientKindQBit, "torboxarr", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("got %d jobs, want 1", len(jobs))
+	}
+	job := jobs[0]
+	if job.SourceType != store.SourceTypeTorrent || job.ClientKind != store.ClientKindQBit || job.SourceURI == nil || *job.SourceURI != magnet {
+		t.Fatalf("job = %+v, want qBit torrent with original magnet", job)
+	}
+	if job.InfoHash == nil || *job.InfoHash != "0123456789abcdef0123456789abcdef01234567" || job.PayloadRef != nil {
+		t.Fatalf("job hash/payload = %v/%v, want normalized hash and no payload", job.InfoHash, job.PayloadRef)
+	}
+}
+
+func TestRunAddTorrent_RealRouterPersistsPayload(t *testing.T) {
+	srv, st := newManualAddRouter(t)
+	t.Setenv("TORBOXARR_QBIT_PASSWORD", "password")
+	path := writeTempFile(t, string(validTorrentBytes()))
+
+	if err := runAddAt(context.Background(), srv.URL, "torboxarr", "", path); err != nil {
+		t.Fatalf("expected real-router success, got %v", err)
+	}
+
+	jobs, err := st.ListVisibleClientJobs(context.Background(), store.ClientKindQBit, "torboxarr", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("got %d jobs, want 1", len(jobs))
+	}
+	job := jobs[0]
+	if job.SourceType != store.SourceTypeTorrent || job.ClientKind != store.ClientKindQBit || job.PayloadRef == nil {
+		t.Fatalf("job = %+v, want qBit torrent with payload", job)
+	}
+	if job.Metadata.UploadedFilename != filepath.Base(path) || job.Metadata.OriginalFilename != filepath.Base(path) {
+		t.Fatalf("job metadata = %+v, want uploaded and original filename", job.Metadata)
+	}
+	payload, err := os.ReadFile(*job.PayloadRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(payload, validTorrentBytes()) {
+		t.Fatalf("stored payload does not match torrent input")
+	}
+}
+
+func TestRunAddNZB_ResponseDoesNotLeakAPIKey(t *testing.T) {
+	opts := defaultSABAddServerOptions()
+	opts.configBody = "not json"
+	srv, _ := newSABAddServer(t, opts)
+	withSABAPIKey(t)
+	path := writeTempNZB(t, `<nzb></nzb>`)
+
+	err := runAddInputAt(context.Background(), srv.URL, addInput{Category: "tv", NZBPath: path})
+	if err == nil || strings.Contains(err.Error(), "sab-secret") || strings.Contains(err.Error(), "apikey=") {
+		t.Fatalf("expected redacted category error, got %v", err)
 	}
 }
