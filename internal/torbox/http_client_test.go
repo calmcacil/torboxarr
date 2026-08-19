@@ -1,8 +1,10 @@
 package torbox_test
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -11,6 +13,65 @@ import (
 
 	"github.com/mrjoiny/torboxarr/internal/torbox"
 )
+
+func TestForceStartQueuedTask(t *testing.T) {
+	client, _ := newTestHTTPClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/queued/controlqueued" {
+			t.Fatalf("request = %s %s", r.Method, r.URL.Path)
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := []byte(`{"queued_id":42,"operation":"start"}`)
+		if !bytes.Equal(body, want) {
+			t.Fatalf("body = %s, want %s", body, want)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(jsonEnvelope(nil))
+	})
+	if err := client.ForceStartQueuedTask(t.Context(), "torrent", "42"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestForceStartQueuedTaskRejectsNonNumericID(t *testing.T) {
+	client, _ := newTestHTTPClient(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("request must not be made")
+	})
+	if err := client.ForceStartQueuedTask(t.Context(), "torrent", "queue-42"); err == nil {
+		t.Fatal("expected non-numeric queue ID error")
+	}
+}
+
+func TestForceStartQueuedTaskPropagatesAPIError(t *testing.T) {
+	client, _ := newTestHTTPClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"success":false,"error":"NO_SLOTS","detail":"no slots"}`))
+	})
+	if err := client.ForceStartQueuedTask(t.Context(), "torrent", "42"); err == nil {
+		t.Fatal("expected force-start API error")
+	}
+}
+
+func TestQueuedStatusParsesCreationTimestamp(t *testing.T) {
+	client, _ := newTestHTTPClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(jsonEnvelope([]map[string]any{{
+			"id":         42,
+			"created_at": "2026-08-19T12:00:00Z",
+			"hash":       "queued-hash",
+		}}))
+	})
+	status, err := client.FindQueuedTask(t.Context(), "torrent", "42", "", "queued-hash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.QueueCreatedAt == nil || !status.QueueCreatedAt.Equal(time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)) {
+		t.Fatalf("QueueCreatedAt = %v", status.QueueCreatedAt)
+	}
+}
 
 func newTestHTTPClient(t *testing.T, handler http.HandlerFunc) (*torbox.HTTPClient, *httptest.Server) {
 	t.Helper()

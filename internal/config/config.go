@@ -79,6 +79,7 @@ type Config struct {
 		SubmitRetryMax        time.Duration
 		RemovedRetention      time.Duration
 		RemoteAbsenceAttempts int
+		QueuedForceStartAfter time.Duration
 		BatchSize             int
 	}
 }
@@ -88,7 +89,9 @@ func Load() (*Config, error) {
 	if err := loadDotEnv(".env"); err != nil {
 		return nil, err
 	}
-	applyEnv(&cfg)
+	if err := applyEnv(&cfg); err != nil {
+		return nil, err
+	}
 	cfg.applyDerived()
 	if err := cfg.Validate(); err != nil {
 		return nil, err
@@ -127,6 +130,7 @@ func defaultConfig() Config {
 	cfg.Workers.SubmitRetryMax = 15 * time.Minute
 	cfg.Workers.RemovedRetention = 30 * 24 * time.Hour
 	cfg.Workers.RemoteAbsenceAttempts = 5
+	cfg.Workers.QueuedForceStartAfter = 3 * time.Hour
 	cfg.Workers.BatchSize = 25
 	cfg.applyDerived()
 	return cfg
@@ -155,7 +159,7 @@ func (c *Config) applyDerived() {
 	}
 }
 
-func applyEnv(cfg *Config) {
+func applyEnv(cfg *Config) error {
 	setString := func(ptr *string, key string) {
 		if v := strings.TrimSpace(os.Getenv(key)); v != "" {
 			*ptr = v
@@ -183,6 +187,14 @@ func applyEnv(cfg *Config) {
 			cfg.Workers.RemoteAbsenceAttempts = parsed
 		}
 	}
+	if v := strings.TrimSpace(os.Getenv("TORBOXARR_QUEUED_FORCE_START_AFTER")); v != "" {
+		parsed, err := time.ParseDuration(v)
+		if err != nil {
+			return fmt.Errorf("TORBOXARR_QUEUED_FORCE_START_AFTER must be a duration: %w", err)
+		}
+		cfg.Workers.QueuedForceStartAfter = parsed
+	}
+	return nil
 }
 
 func (c *Config) Validate() error {
@@ -204,6 +216,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Workers.RemoteAbsenceAttempts < 1 {
 		return errors.New("workers.remote_absence_attempts must be positive")
+	}
+	if c.Workers.QueuedForceStartAfter < 0 {
+		return errors.New("workers.queued_force_start_after must not be negative")
 	}
 	if err := validateSecret("torbox.api_token", c.TorBox.APIToken); err != nil {
 		return err

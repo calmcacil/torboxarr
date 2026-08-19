@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/mrjoiny/torboxarr/internal/store"
@@ -126,6 +127,8 @@ func hasQueueTracking(job *store.Job) bool {
 }
 
 func (o *Orchestrator) keepQueued(ctx context.Context, job *store.Job, status *torbox.TaskStatus) error {
+	now := time.Now().UTC()
+	o.prepareQueuedMetadata(job, status, now)
 	job.Metadata.PollAttempts = 0
 	job.ErrorMessage = nil
 	job.RemoteID = nil
@@ -141,9 +144,10 @@ func (o *Orchestrator) keepQueued(ctx context.Context, job *store.Job, status *t
 	if status.Name != "" {
 		job.DisplayName = status.Name
 	}
-	nextRun := time.Now().UTC().Add(withJitter(o.cfg.Workers.PollInterval))
+	o.maybeForceStartQueued(ctx, job, now)
+	nextRun := now.Add(withJitter(o.cfg.Workers.PollInterval))
 	job.NextRunAt = &nextRun
-	job.UpdatedAt = time.Now().UTC()
+	job.UpdatedAt = now
 	o.log.Info("remote task still queued",
 		"job_id", job.ID,
 		"public_id", job.PublicID,
@@ -156,6 +160,7 @@ func (o *Orchestrator) keepQueued(ctx context.Context, job *store.Job, status *t
 }
 
 func (o *Orchestrator) restoreQueued(ctx context.Context, job *store.Job, status *torbox.TaskStatus) error {
+	o.prepareQueuedMetadata(job, status, time.Now().UTC())
 	job.Metadata.PollAttempts = 0
 	job.ErrorMessage = nil
 	job.RemoteID = nil
@@ -184,6 +189,68 @@ func (o *Orchestrator) restoreQueued(ctx context.Context, job *store.Job, status
 	}
 	o.log.Info("active task recovered in remote queue", "job_id", job.ID, "public_id", job.PublicID, "queued_id", deref(job.QueuedID))
 	return nil
+}
+
+func (o *Orchestrator) prepareQueuedMetadata(job *store.Job, status *torbox.TaskStatus, now time.Time) {
+	previousID := deref(job.QueuedID)
+	nextID := strings.TrimSpace(status.QueuedID)
+	if previousID != "" && nextID != "" && previousID != nextID {
+		job.Metadata.QueuedAt = nil
+		job.Metadata.ForceStartLastAttemptAt = nil
+		job.Metadata.ForceStartAcceptedAt = nil
+	}
+	if nextID != "" {
+		job.QueuedID = ptr(nextID)
+	}
+	if job.Metadata.QueuedAt != nil {
+		return
+	}
+	queuedAt := now
+	if status.QueueCreatedAt != nil && !status.QueueCreatedAt.After(now) {
+		queuedAt = status.QueueCreatedAt.UTC()
+	}
+	job.Metadata.QueuedAt = &queuedAt
+}
+
+func (o *Orchestrator) maybeForceStartQueued(ctx context.Context, job *store.Job, now time.Time) {
+	threshold := o.cfg.Workers.QueuedForceStartAfter
+	if threshold <= 0 || job.Metadata.ForceStartAcceptedAt != nil {
+		return
+	}
+	queuedID := strings.TrimSpace(deref(job.QueuedID))
+	if queuedID == "" || job.Metadata.QueuedAt == nil || now.Before(job.Metadata.QueuedAt.Add(threshold)) {
+		return
+	}
+	if job.Metadata.ForceStartLastAttemptAt != nil && now.Before(job.Metadata.ForceStartLastAttemptAt.Add(o.cfg.Workers.PollInterval)) {
+		return
+	}
+
+	o.log.Info("queued job eligible for force start",
+		"job_id", job.ID,
+		"public_id", job.PublicID,
+		"source_type", job.SourceType,
+		"queued_id", queuedID,
+		"queue_age", now.Sub(*job.Metadata.QueuedAt).String(),
+		"threshold", threshold.String(),
+	)
+	job.Metadata.ForceStartLastAttemptAt = &now
+	if err := o.torbox.ForceStartQueuedTask(ctx, string(job.SourceType), queuedID); err != nil {
+		o.log.Warn("force start queued job failed; will retry",
+			"job_id", job.ID,
+			"public_id", job.PublicID,
+			"source_type", job.SourceType,
+			"queued_id", queuedID,
+			"error", err,
+		)
+		return
+	}
+	job.Metadata.ForceStartAcceptedAt = &now
+	o.log.Info("force start queued job accepted",
+		"job_id", job.ID,
+		"public_id", job.PublicID,
+		"source_type", job.SourceType,
+		"queued_id", queuedID,
+	)
 }
 
 func (o *Orchestrator) applyActiveStatus(ctx context.Context, job *store.Job, status *torbox.TaskStatus) error {

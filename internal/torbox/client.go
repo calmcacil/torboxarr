@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 )
 
 type Client interface {
@@ -13,6 +14,7 @@ type Client interface {
 	FindQueuedTask(ctx context.Context, sourceType string, queuedID, queueAuthID, remoteHash string) (*TaskStatus, error)
 	GetTaskStatus(ctx context.Context, sourceType string, remoteID string) (*TaskStatus, error)
 	FindActiveTask(ctx context.Context, sourceType string, remoteID, queueAuthID, remoteHash string) (*TaskStatus, error)
+	ForceStartQueuedTask(ctx context.Context, sourceType, queuedID string) error
 	GetDownloadLinks(ctx context.Context, sourceType string, remoteID string) ([]DownloadAsset, error)
 	DeleteTask(ctx context.Context, sourceType string, remoteID string) error
 }
@@ -71,6 +73,7 @@ type TaskStatus struct {
 	Failed           bool
 	Inactive         bool
 	Error            string
+	QueueCreatedAt   *time.Time
 	Files            []RemoteFile
 }
 

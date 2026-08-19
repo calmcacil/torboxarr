@@ -65,6 +65,10 @@ type SubmissionMetadata struct {
 	// has seen. Used to cap retries so a job whose upstream task no longer
 	// exists (or a sustained TorBox outage) doesn't poll forever.
 	PollAttempts int `json:"poll_attempts,omitempty"`
+
+	QueuedAt                *time.Time `json:"queued_at,omitempty"`
+	ForceStartLastAttemptAt *time.Time `json:"force_start_last_attempt_at,omitempty"`
+	ForceStartAcceptedAt    *time.Time `json:"force_start_accepted_at,omitempty"`
 }
 
 type Job struct {
