@@ -68,6 +68,7 @@ Optional overrides:
 | `TORBOXARR_DATA_ROOT` | `/data` | Root directory for staging, completed files, and payloads |
 | `TORBOXARR_DATABASE_PATH` | `/config/torboxarr.db` | SQLite database path; the container stores state under `/config` |
 | `TORBOXARR_LOG_LEVEL` | `INFO` | Log verbosity: DEBUG, INFO, WARN, or ERROR |
+| `TORBOXARR_REMOTE_ABSENCE_ATTEMPTS` | `5` | Successful queue/active absence checks before a remote job is marked failed |
 | `TORBOXARR_SAB_NZB_KEY` | falls back to `TORBOXARR_SAB_API_KEY` | Explicit key for the SABnzbd-compatible endpoint; omit it to reuse the SAB API key |
 
 Docker-specific runtime variables used by the bundled compose file. Set these to the same UID/GID that Sonarr and Radarr use on the host, so TorBoxarr can write to the same download and category folders:

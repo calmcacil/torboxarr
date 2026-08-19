@@ -10,6 +10,7 @@ type Client interface {
 	CreateTorrentTask(ctx context.Context, req CreateTorrentTaskRequest) (*CreateTaskResponse, error)
 	CreateUsenetTask(ctx context.Context, req CreateUsenetTaskRequest) (*CreateTaskResponse, error)
 	GetQueuedStatus(ctx context.Context, sourceType string, queuedID string) (*TaskStatus, error)
+	FindQueuedTask(ctx context.Context, sourceType string, queuedID, queueAuthID, remoteHash string) (*TaskStatus, error)
 	GetTaskStatus(ctx context.Context, sourceType string, remoteID string) (*TaskStatus, error)
 	FindActiveTask(ctx context.Context, sourceType string, remoteID, queueAuthID, remoteHash string) (*TaskStatus, error)
 	GetDownloadLinks(ctx context.Context, sourceType string, remoteID string) ([]DownloadAsset, error)
@@ -36,11 +37,12 @@ type CreateUsenetTaskRequest struct {
 }
 
 type CreateTaskResponse struct {
-	RemoteID    string
-	QueuedID    string
-	QueueAuthID string
-	RemoteHash  string
-	DisplayName string
+	RemoteID         string
+	ActiveIDExplicit bool
+	QueuedID         string
+	QueueAuthID      string
+	RemoteHash       string
+	DisplayName      string
 }
 
 type RemoteFile struct {

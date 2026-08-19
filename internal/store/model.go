@@ -56,6 +56,9 @@ type SubmissionMetadata struct {
 	AddOnlyIfCached  bool     `json:"add_only_if_cached,omitempty"`
 	UploadedFilename string   `json:"uploaded_filename,omitempty"`
 	OriginalFilename string   `json:"original_filename,omitempty"`
+	// PollAttempts counts consecutive successful TorBox status checks that
+	// found neither a queued nor an active entry.
+	PollAttempts int `json:"poll_attempts,omitempty"`
 }
 
 type Job struct {

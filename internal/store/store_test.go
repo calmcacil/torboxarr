@@ -143,6 +143,38 @@ func TestUpdateJobState(t *testing.T) {
 	}
 }
 
+func TestUpdateJobStateIfCurrentRejectsConcurrentRemoval(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	job := makeJob("conditional-001", "pub-conditional-001", store.StateRemoteActive)
+	job.State = store.StateRemoteActive
+	if err := st.CreateJob(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+
+	job.DeleteRequested = true
+	if err := st.UpdateJobState(ctx, job, store.StateRemovePending, "remove requested"); err != nil {
+		t.Fatal(err)
+	}
+
+	job.State = store.StateRemoteActive
+	job.NextRunAt = timePtr(time.Now().UTC())
+	ok, err := st.UpdateJobStateIfCurrent(ctx, job, store.StateRemoteActive, store.StateRemoteQueued, "stale recovery")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatal("stale poll update should not be applied after removal")
+	}
+	got, err := st.GetJobByID(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != store.StateRemovePending {
+		t.Fatalf("state = %s, want remove_pending", got.State)
+	}
+}
+
 // ─── FindActiveBySubmissionKey ───────────────────────────────────────────────
 
 func TestFindActiveBySubmissionKey(t *testing.T) {

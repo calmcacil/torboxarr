@@ -7,7 +7,7 @@ import (
 	"strings"
 )
 
-func parseCreateTask(env *apiEnvelope) (*CreateTaskResponse, error) {
+func parseCreateTask(env *apiEnvelope, asQueued bool) (*CreateTaskResponse, error) {
 	if env == nil {
 		return nil, fmt.Errorf("empty response envelope")
 	}
@@ -17,18 +17,27 @@ func parseCreateTask(env *apiEnvelope) (*CreateTaskResponse, error) {
 
 	var object map[string]any
 	if err := json.Unmarshal(env.Data, &object); err == nil {
+		activeID := extractActiveID("", object, false)
+		queuedID := firstString(object, "queued_id", "queue_id")
+		if activeID == "" {
+			queuedID = extractQueuedID(object)
+		}
 		return &CreateTaskResponse{
-			RemoteID:    extractActiveID("", object, true),
-			QueuedID:    extractQueuedID(object),
-			QueueAuthID: extractQueueAuthID("", object),
-			RemoteHash:  firstString(object, "hash"),
-			DisplayName: firstString(object, "name", "filename"),
+			RemoteID:         activeID,
+			ActiveIDExplicit: activeID != "",
+			QueuedID:         queuedID,
+			QueueAuthID:      extractQueueAuthID("", object),
+			RemoteHash:       firstString(object, "hash"),
+			DisplayName:      firstString(object, "name", "filename"),
 		}, nil
 	}
 
 	var idOnly any
 	if err := json.Unmarshal(env.Data, &idOnly); err == nil {
 		if id := stringify(idOnly); id != "" {
+			if asQueued {
+				return &CreateTaskResponse{QueuedID: id}, nil
+			}
 			return &CreateTaskResponse{RemoteID: id}, nil
 		}
 	}
@@ -83,7 +92,7 @@ func parseLinkEnvelope(env *apiEnvelope) (string, error) {
 	return "", fmt.Errorf("unable to parse download link response")
 }
 
-func parseTaskStatus(sourceType string, item map[string]any) *TaskStatus {
+func parseTaskStatus(sourceType string, item map[string]any, active bool) *TaskStatus {
 	files := extractRemoteFiles(item)
 	progress := firstFloat(item, "progress", "download_progress")
 	bytesTotal := firstInt(item, "size", "total_bytes", "download_size")
@@ -121,8 +130,12 @@ func parseTaskStatus(sourceType string, item map[string]any) *TaskStatus {
 	failed := (stateFailed || labelFailed) && !downloadReady
 	inactive := label == "inactive" || firstBool(item, "inactive")
 
+	remoteID := ""
+	if active {
+		remoteID = extractActiveID(sourceType, item, true)
+	}
 	return &TaskStatus{
-		RemoteID:         extractActiveID(sourceType, item, true),
+		RemoteID:         remoteID,
 		QueuedID:         extractQueuedID(item),
 		QueueAuthID:      extractQueueAuthID(sourceType, item),
 		Hash:             firstString(item, "hash"),
@@ -166,7 +179,7 @@ func extractQueueAuthID(sourceType string, item map[string]any) string {
 	if authID := firstString(item, "auth_id"); authID != "" {
 		return authID
 	}
-	if !strings.EqualFold(sourceType, "usenet") {
+	if !isUsenetSource(sourceType) {
 		return ""
 	}
 	torrentFile := firstString(item, "torrent_file")
