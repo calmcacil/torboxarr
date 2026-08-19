@@ -97,6 +97,10 @@ func (o *Orchestrator) processSubmitJob(ctx context.Context, job *store.Job) err
 	}
 	job.ErrorMessage = nil
 	job.RetryCount = 0
+	if remoteID == "" && job.Metadata.QueuedAt == nil {
+		now := time.Now().UTC()
+		job.Metadata.QueuedAt = &now
+	}
 	nextRun := time.Now().UTC().Add(o.cfg.Workers.PollInterval)
 	job.NextRunAt = &nextRun
 	job.UpdatedAt = time.Now().UTC()

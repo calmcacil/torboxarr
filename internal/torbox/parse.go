@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 )
 
 func parseCreateTask(env *apiEnvelope, asQueued bool) (*CreateTaskResponse, error) {
@@ -151,8 +152,27 @@ func parseTaskStatus(sourceType string, item map[string]any, active bool) *TaskS
 		Failed:           failed,
 		Inactive:         inactive,
 		Error:            errorText,
+		QueueCreatedAt:   queueCreatedAt(item, active),
 		Files:            files,
 	}
+}
+
+func parseTimestamp(value string) *time.Time {
+	if value == "" {
+		return nil
+	}
+	parsed, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		return nil
+	}
+	return &parsed
+}
+
+func queueCreatedAt(item map[string]any, active bool) *time.Time {
+	if active {
+		return nil
+	}
+	return parseTimestamp(firstString(item, "created_at"))
 }
 
 func extractQueuedID(item map[string]any) string {

@@ -243,6 +243,21 @@ func (c *HTTPClient) FindActiveTask(ctx context.Context, sourceType string, remo
 	return nil, nil
 }
 
+func (c *HTTPClient) ForceStartQueuedTask(ctx context.Context, sourceType, queuedID string) error {
+	id, err := strconv.ParseInt(strings.TrimSpace(queuedID), 10, 64)
+	if err != nil || id < 0 {
+		return fmt.Errorf("force start: queued id %q is not a non-negative numeric TorBox queue id", queuedID)
+	}
+	if err := c.wait(ctx, c.pollLimiter); err != nil {
+		return err
+	}
+	body := fmt.Sprintf(`{"queued_id":%d,"operation":"start"}`, id)
+	if _, err := c.do(ctx, http.MethodPost, "/api/queued/controlqueued", strings.NewReader(body), "application/json", true); err != nil {
+		return fmt.Errorf("force start queued %s: %w", sourceType, err)
+	}
+	return nil
+}
+
 func matchActiveTask(sourceType string, items []map[string]any, remoteID, queueAuthID, remoteHash string) (*TaskStatus, bool) {
 	for _, item := range items {
 		itemID := extractActiveID(sourceType, item, true)
