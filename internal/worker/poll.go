@@ -175,10 +175,11 @@ func (o *Orchestrator) keepQueued(ctx context.Context, job *store.Job, status *t
 
 func (o *Orchestrator) restoreQueued(ctx context.Context, job *store.Job, status *torbox.TaskStatus) error {
 	// A queue match after an active state is a new lifecycle unless the concrete
-	// queue ID proves that the prior lifecycle continued uninterrupted.
+	// queue ID and an accepted force-start prove that the prior lifecycle
+	// continued uninterrupted.
 	previousID := strings.TrimSpace(deref(job.QueuedID))
 	nextID := strings.TrimSpace(status.QueuedID)
-	if job.State == store.StateRemoteActive && (previousID == "" || nextID == "" || previousID != nextID) {
+	if job.State == store.StateRemoteActive && (job.Metadata.ForceStartAcceptedAt == nil || previousID == "" || nextID == "" || previousID != nextID) {
 		job.Metadata.QueuedAt = nil
 		job.Metadata.ForceStartLastAttemptAt = nil
 		job.Metadata.ForceStartAcceptedAt = nil

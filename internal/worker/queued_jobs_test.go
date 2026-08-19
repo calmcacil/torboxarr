@@ -615,6 +615,78 @@ func TestProcessPollJob_ActiveMissRecoversQueued(t *testing.T) {
 	}
 }
 
+func TestProcessPollJob_ActiveToQueuedWithoutAcceptedForceStartStartsNewLifecycle(t *testing.T) {
+	env := newQueuedTestEnv(t)
+	oldQueuedAt := time.Now().UTC().Add(-24 * time.Hour)
+	job := queuedTestJob("active-queued-new-lifecycle", store.StateRemoteActive)
+	job.RemoteID = stringPtr("99")
+	job.QueuedID = stringPtr("42")
+	job.Metadata.QueuedAt = &oldQueuedAt
+	if err := env.store.CreateJob(context.Background(), job); err != nil {
+		t.Fatal(err)
+	}
+	var calls int
+	env.mock.FindActiveTaskFn = func(context.Context, string, string, string, string) (*torbox.TaskStatus, error) {
+		return nil, errors.New("active task unavailable")
+	}
+	env.mock.FindQueuedTaskFn = func(context.Context, string, string, string, string) (*torbox.TaskStatus, error) {
+		return &torbox.TaskStatus{QueuedID: "42", State: "queued"}, nil
+	}
+	env.mock.ForceStartQueuedTaskFn = func(context.Context, string, string) error {
+		calls++
+		return nil
+	}
+
+	got, _ := env.store.GetJobByID(context.Background(), job.ID)
+	if err := env.orch.processPollJob(context.Background(), got); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = env.store.GetJobByID(context.Background(), job.ID)
+	if got.State != store.StateRemoteQueued {
+		t.Fatalf("state = %s, want remote_queued", got.State)
+	}
+	if calls != 0 {
+		t.Fatalf("force-start calls = %d, want 0 for a new lifecycle", calls)
+	}
+	if got.Metadata.QueuedAt == nil || !got.Metadata.QueuedAt.After(oldQueuedAt) {
+		t.Fatalf("QueuedAt = %v, want new observation after %v", got.Metadata.QueuedAt, oldQueuedAt)
+	}
+}
+
+func TestProcessPollJob_ActiveToQueuedWithAcceptedForceStartRetainsLifecycle(t *testing.T) {
+	env := newQueuedTestEnv(t)
+	queuedAt := time.Now().UTC().Add(-4 * time.Hour)
+	acceptedAt := queuedAt.Add(time.Hour)
+	job := queuedTestJob("active-queued-same-lifecycle", store.StateRemoteActive)
+	job.RemoteID = stringPtr("99")
+	job.QueuedID = stringPtr("42")
+	job.Metadata.QueuedAt = &queuedAt
+	job.Metadata.ForceStartAcceptedAt = &acceptedAt
+	if err := env.store.CreateJob(context.Background(), job); err != nil {
+		t.Fatal(err)
+	}
+	var calls int
+	env.mock.FindActiveTaskFn = func(context.Context, string, string, string, string) (*torbox.TaskStatus, error) {
+		return nil, errors.New("active task unavailable")
+	}
+	env.mock.FindQueuedTaskFn = func(context.Context, string, string, string, string) (*torbox.TaskStatus, error) {
+		return &torbox.TaskStatus{QueuedID: "42", State: "queued"}, nil
+	}
+	env.mock.ForceStartQueuedTaskFn = func(context.Context, string, string) error {
+		calls++
+		return nil
+	}
+
+	got, _ := env.store.GetJobByID(context.Background(), job.ID)
+	if err := env.orch.processPollJob(context.Background(), got); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = env.store.GetJobByID(context.Background(), job.ID)
+	if calls != 0 || got.Metadata.ForceStartAcceptedAt == nil || !got.Metadata.QueuedAt.Equal(queuedAt) {
+		t.Fatalf("calls=%d accepted=%v QueuedAt=%v, want retained lifecycle", calls, got.Metadata.ForceStartAcceptedAt != nil, got.Metadata.QueuedAt)
+	}
+}
+
 func TestProcessPollJob_ActiveMissUsesQueueAuthForUsenetRecovery(t *testing.T) {
 	env := newQueuedTestEnv(t)
 	job := queuedTestJob("active-queued-nzb", store.StateRemoteActive)
