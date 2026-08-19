@@ -13,6 +13,7 @@ FROM alpine:3.23.3
 RUN apk add --no-cache ca-certificates su-exec
 WORKDIR /app
 COPY --from=build /out/torboxarr /app/torboxarr
+RUN ln -s /app/torboxarr /usr/local/bin/torboxarr
 COPY deploy/entrypoint.sh /entrypoint.sh
 RUN chmod 0755 /entrypoint.sh
 EXPOSE 8085
