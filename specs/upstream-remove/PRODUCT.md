@@ -91,6 +91,11 @@ identifier can leave the same task visible elsewhere.
 13. Active and queued cleanup have separate attempt budgets. Each unfinished
     representation receives at most five delete attempts.
 
+13a. Each unfinished representation also receives at most five
+     reconciliation or known-unsent-request failures. These failures do not
+     consume delete attempts, but exhaustion records a warning and allows local
+     cleanup so removal cannot remain pending indefinitely.
+
 14. A timeout, connection failure, rate limit, TorBox server error, or other
     uncertain/retryable result consumes one attempt because the request may
     have reached TorBox.
@@ -133,7 +138,7 @@ identifier can leave the same task visible elsewhere.
     removed-job retention period and are pruned with that job under the existing
     retention policy.
 
-25. Concurrent remover workers must not consume duplicate attempt budgets or
+25. Concurrent remover workers and service instances must not consume duplicate attempt budgets or
     issue ordinary duplicate deletes for the same job. A crash after an API
     request but before persistence may leave the result uncertain; subsequent
     reconciliation prevents another delete when TorBox shows the item absent.

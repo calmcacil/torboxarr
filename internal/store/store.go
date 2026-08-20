@@ -192,8 +192,32 @@ func (s *Store) CreateJob(ctx context.Context, job *Job) error {
 }
 
 func (s *Store) UpdateJob(ctx context.Context, job *Job) error {
+	if job.State == StateRemovePending {
+		if current, err := s.GetJobByID(ctx, job.ID); err != nil {
+			return err
+		} else if current != nil && current.State == StateRemovePending {
+			mergeRemovalProgress(&job.Metadata.ActiveRemoval, current.Metadata.ActiveRemoval)
+			mergeRemovalProgress(&job.Metadata.QueuedRemoval, current.Metadata.QueuedRemoval)
+		}
+	}
 	_, err := s.updateJob(ctx, job, "", nil)
 	return err
+}
+
+func mergeRemovalProgress(next *UpstreamRemovalProgress, current UpstreamRemovalProgress) {
+	if current.Terminal() {
+		*next = current
+		return
+	}
+	if next.Attempts < current.Attempts {
+		next.Attempts = current.Attempts
+	}
+	if next.ReconciliationFailures < current.ReconciliationFailures {
+		next.ReconciliationFailures = current.ReconciliationFailures
+	}
+	if next.LastError == "" {
+		next.LastError = current.LastError
+	}
 }
 
 // UpdateJobIfState persists a job only while it remains in expectedState and
@@ -603,11 +627,30 @@ func (s *Store) ReleaseJobClaim(ctx context.Context, jobID string) error {
 	return err
 }
 
+func (s *Store) ReleaseJobClaimOwned(ctx context.Context, jobID, owner string) error {
+	_, err := s.execWrite(ctx, `
+        UPDATE jobs SET claimed_by = NULL, claimed_at = NULL
+        WHERE id = ? AND claimed_by = ?
+    `, jobID, owner)
+	return err
+}
+
 // ReleaseAllClaims clears all outstanding claims. Used on startup to recover
 // from crashes that left jobs claimed by a previous process.
 func (s *Store) ReleaseAllClaims(ctx context.Context) error {
 	_, err := s.execWrite(ctx,
 		`UPDATE jobs SET claimed_by = NULL, claimed_at = NULL WHERE claimed_by IS NOT NULL`)
+	return err
+}
+
+// RecoverClaims releases ordinary worker claims immediately and remover claims
+// only after their conservative lease has expired.
+func (s *Store) RecoverClaims(ctx context.Context, removerCutoff time.Time) error {
+	_, err := s.execWrite(ctx, `
+        UPDATE jobs SET claimed_by = NULL, claimed_at = NULL
+        WHERE claimed_by IS NOT NULL
+          AND (state != 'remove_pending' OR claimed_at IS NULL OR claimed_at < ?)
+    `, formatTime(removerCutoff))
 	return err
 }
 

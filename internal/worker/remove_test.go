@@ -617,6 +617,67 @@ func TestProcessRemoveJob_LookupFailureDoesNotBlockOtherView(t *testing.T) {
 	}
 }
 
+func TestProcessRemoveJob_QueuedPromotionRefreshesActiveView(t *testing.T) {
+	env := newRemoveTestEnv(t)
+	env.orch.cfg.UpstreamRemove = true
+	var activeLookups, activeDeletes int
+	env.mock.FindActiveTaskFn = func(_ context.Context, _, remoteID, _, _ string) (*torbox.TaskStatus, error) {
+		activeLookups++
+		if remoteID == "901" {
+			return &torbox.TaskStatus{RemoteID: remoteID}, nil
+		}
+		return nil, nil
+	}
+	env.mock.FindQueuedTaskFn = func(_ context.Context, _, queuedID, _, _ string) (*torbox.TaskStatus, error) {
+		return &torbox.TaskStatus{QueuedID: queuedID, RemoteID: "901"}, nil
+	}
+	env.mock.DeleteTaskFn = func(_ context.Context, _, remoteID string) error {
+		activeDeletes++
+		if remoteID != "901" {
+			t.Fatalf("active delete id = %q, want 901", remoteID)
+		}
+		return nil
+	}
+
+	job := env.insertRemovePendingJob(t, "queued-promotion", "", store.SourceTypeTorrent)
+	job.QueuedID = ptr("902")
+	if err := env.store.UpdateJob(context.Background(), job); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.orch.processRemoveJob(context.Background(), job); err != nil {
+		t.Fatalf("processRemoveJob: %v", err)
+	}
+	if activeLookups != 2 || activeDeletes != 1 {
+		t.Fatalf("active calls = lookups:%d deletes:%d, want 2 and 1", activeLookups, activeDeletes)
+	}
+}
+
+func TestProcessRemoveJob_LookupFailuresAreBounded(t *testing.T) {
+	env := newRemoveTestEnv(t)
+	env.orch.cfg.UpstreamRemove = true
+	env.mock.FindActiveTaskFn = func(context.Context, string, string, string, string) (*torbox.TaskStatus, error) {
+		return nil, errors.New("lookup unavailable")
+	}
+
+	job := env.insertRemovePendingJob(t, "lookup-exhausted", "903", store.SourceTypeTorrent)
+	for attempt := 1; attempt <= maxUpstreamReconciliationFailures; attempt++ {
+		if err := env.orch.processRemoveJob(context.Background(), job); err != nil {
+			t.Fatalf("attempt %d: %v", attempt, err)
+		}
+		var err error
+		job, err = env.store.GetJobByID(context.Background(), job.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if job.State != store.StateRemoved || job.Metadata.ActiveRemoval.Outcome != store.UpstreamRemovalExhausted {
+		t.Fatalf("state = %s outcome = %q, want removed/exhausted", job.State, job.Metadata.ActiveRemoval.Outcome)
+	}
+	if job.Metadata.ActiveRemoval.Attempts != 0 || job.Metadata.ActiveRemoval.ReconciliationFailures != maxUpstreamReconciliationFailures {
+		t.Fatalf("progress = %#v, want zero delete attempts and bounded reconciliation failures", job.Metadata.ActiveRemoval)
+	}
+}
+
 func TestProcessRemoveJob_AlreadyAbsentDoesNotWarn(t *testing.T) {
 	env := newRemoveTestEnv(t)
 	env.orch.cfg.UpstreamRemove = true

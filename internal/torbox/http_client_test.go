@@ -1084,6 +1084,40 @@ func TestHTTPErrorClassification(t *testing.T) {
 	}
 }
 
+func TestStructuredErrorSemanticClassification(t *testing.T) {
+	tests := []struct {
+		code        string
+		wantAbsent  bool
+		wantStatus  int
+		wantLogical bool
+	}{
+		{code: "ITEM_NOT_FOUND", wantAbsent: true},
+		{code: "INVALID_OPTION", wantStatus: http.StatusBadRequest},
+		{code: "MISSING_REQUIRED_OPTION", wantStatus: http.StatusBadRequest},
+		{code: "BAD_TOKEN", wantStatus: http.StatusUnauthorized},
+		{code: "DATABASE_ERROR", wantLogical: true},
+		{code: "UNKNOWN_ERROR", wantLogical: true},
+	}
+	for _, test := range tests {
+		t.Run(test.code, func(t *testing.T) {
+			client, _ := newTestHTTPClient(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = fmt.Fprintf(w, `{"success":false,"error":%q}`, test.code)
+			})
+			err := client.DeleteTask(t.Context(), "torrent", "1")
+			if got := torbox.IsTorboxAbsent(err); got != test.wantAbsent {
+				t.Fatalf("absent = %v, want %v; err = %v", got, test.wantAbsent, err)
+			}
+			if test.wantStatus != 0 && !torbox.IsHTTPStatus(err, test.wantStatus) {
+				t.Fatalf("error = %v, want HTTP status %d", err, test.wantStatus)
+			}
+			if got := torbox.IsTorboxLogical(err); got != test.wantLogical {
+				t.Fatalf("logical = %v, want %v; err = %v", got, test.wantLogical, err)
+			}
+		})
+	}
+}
+
 func TestDeleteTaskGenericNotFoundIsNotAbsence(t *testing.T) {
 	client, _ := newTestHTTPClient(t, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
