@@ -145,7 +145,10 @@ func (o *Orchestrator) keepQueued(ctx context.Context, job *store.Job, status *t
 	if status.Name != "" {
 		job.DisplayName = status.Name
 	}
-	retryAt := o.maybeForceStartQueued(ctx, job, status, now)
+	retryAt, err := o.maybeForceStartQueued(ctx, job, status, now)
+	if err != nil {
+		return err
+	}
 	nextRun := time.Now().UTC().Add(withJitter(o.cfg.Workers.PollInterval))
 	if !retryAt.IsZero() {
 		nextRun = retryAt
@@ -179,12 +182,15 @@ func (o *Orchestrator) restoreQueued(ctx context.Context, job *store.Job, status
 	// continued uninterrupted.
 	previousID := strings.TrimSpace(deref(job.QueuedID))
 	nextID := strings.TrimSpace(status.QueuedID)
-	if job.State == store.StateRemoteActive && (job.Metadata.ForceStartAcceptedAt == nil || previousID == "" || nextID == "" || previousID != nextID) {
+	resetLifecycle := job.State == store.StateRemoteActive && (job.Metadata.ForceStartAcceptedAt == nil || previousID == "" || nextID == "" || previousID != nextID)
+	if resetLifecycle {
 		job.Metadata.QueuedAt = nil
 		job.Metadata.ForceStartLastAttemptAt = nil
 		job.Metadata.ForceStartAcceptedAt = nil
+		job.Metadata.IgnoreQueueCreatedAt = previousID == "" || nextID == "" || previousID == nextID
 	}
-	o.prepareQueuedMetadata(job, status, time.Now().UTC())
+	now := time.Now().UTC()
+	o.prepareQueuedMetadata(job, status, now)
 	job.Metadata.PollAttempts = 0
 	job.ErrorMessage = nil
 	job.RemoteID = nil
@@ -200,9 +206,9 @@ func (o *Orchestrator) restoreQueued(ctx context.Context, job *store.Job, status
 	if status.Name != "" {
 		job.DisplayName = status.Name
 	}
-	nextRun := time.Now().UTC().Add(withJitter(o.cfg.Workers.PollInterval))
+	nextRun := now.Add(withJitter(o.cfg.Workers.PollInterval))
 	job.NextRunAt = &nextRun
-	job.UpdatedAt = time.Now().UTC()
+	job.UpdatedAt = now
 	if job.State == store.StateRemoteQueued {
 		ok, err := o.store.UpdateJobIfState(ctx, job, store.StateRemoteQueued)
 		if err != nil {
@@ -232,6 +238,7 @@ func (o *Orchestrator) prepareQueuedMetadata(job *store.Job, status *torbox.Task
 		job.Metadata.QueuedAt = nil
 		job.Metadata.ForceStartLastAttemptAt = nil
 		job.Metadata.ForceStartAcceptedAt = nil
+		job.Metadata.IgnoreQueueCreatedAt = false
 	}
 	if nextID != "" {
 		job.QueuedID = ptr(nextID)
@@ -239,7 +246,7 @@ func (o *Orchestrator) prepareQueuedMetadata(job *store.Job, status *torbox.Task
 	// Prefer the earliest trustworthy timestamp for this queue identity. A
 	// submission records local acceptance first, while the queue response may
 	// later provide an earlier server-side creation time.
-	if status.QueueCreatedAt != nil && !status.QueueCreatedAt.After(now) {
+	if !job.Metadata.IgnoreQueueCreatedAt && status.QueueCreatedAt != nil && !status.QueueCreatedAt.After(now) {
 		queuedAt := status.QueueCreatedAt.UTC()
 		if job.Metadata.QueuedAt == nil || queuedAt.Before(job.Metadata.QueuedAt.UTC()) {
 			job.Metadata.QueuedAt = &queuedAt
@@ -251,13 +258,13 @@ func (o *Orchestrator) prepareQueuedMetadata(job *store.Job, status *torbox.Task
 	}
 }
 
-func (o *Orchestrator) maybeForceStartQueued(ctx context.Context, job *store.Job, status *torbox.TaskStatus, now time.Time) time.Time {
+func (o *Orchestrator) maybeForceStartQueued(ctx context.Context, job *store.Job, status *torbox.TaskStatus, now time.Time) (time.Time, error) {
 	threshold := o.cfg.Workers.QueuedForceStartAfter
 	if threshold <= 0 || job.Metadata.ForceStartAcceptedAt != nil {
-		return time.Time{}
+		return time.Time{}, nil
 	}
 	if job.Metadata.QueuedAt == nil || now.Before(job.Metadata.QueuedAt.Add(threshold)) {
-		return time.Time{}
+		return time.Time{}, nil
 	}
 	if job.DeleteRequested {
 		o.log.Warn("force start skipped because removal was requested",
@@ -266,7 +273,7 @@ func (o *Orchestrator) maybeForceStartQueued(ctx context.Context, job *store.Job
 			"source_type", job.SourceType,
 			"queued_id", deref(job.QueuedID),
 		)
-		return time.Time{}
+		return time.Time{}, nil
 	}
 	if !supportsForceStart(job.SourceType) {
 		o.log.Warn("force start skipped because source type is unsupported",
@@ -275,7 +282,7 @@ func (o *Orchestrator) maybeForceStartQueued(ctx context.Context, job *store.Job
 			"source_type", job.SourceType,
 			"queued_id", deref(job.QueuedID),
 		)
-		return time.Time{}
+		return time.Time{}, nil
 	}
 	// Only the identifier returned by this successful queue lookup can authorize
 	// a control request. Do not reuse a stale job identifier for hash matches.
@@ -289,10 +296,33 @@ func (o *Orchestrator) maybeForceStartQueued(ctx context.Context, job *store.Job
 			"queue_age", now.Sub(*job.Metadata.QueuedAt).String(),
 			"threshold", threshold.String(),
 		)
-		return time.Time{}
+		return time.Time{}, nil
 	}
 	if job.Metadata.ForceStartLastAttemptAt != nil && now.Before(job.Metadata.ForceStartLastAttemptAt.Add(o.cfg.Workers.PollInterval)) {
-		return time.Time{}
+		return time.Time{}, nil
+	}
+
+	current, err := o.store.GetJobByID(ctx, job.ID)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("confirm force-start local state: %w", err)
+	}
+	if current != nil && (current.DeleteRequested || current.State == store.StateRemovePending || current.State == store.StateRemoved) {
+		o.log.Warn("force start skipped because removal was requested",
+			"job_id", job.ID,
+			"public_id", job.PublicID,
+			"source_type", job.SourceType,
+			"queued_id", queuedID,
+		)
+		return time.Time{}, nil
+	}
+	if current == nil || current.State != store.StateRemoteQueued {
+		o.log.Warn("force start skipped because local state changed",
+			"job_id", job.ID,
+			"public_id", job.PublicID,
+			"source_type", job.SourceType,
+			"queued_id", queuedID,
+		)
+		return time.Time{}, nil
 	}
 
 	o.log.Info("queued job eligible for force start",
@@ -314,7 +344,7 @@ func (o *Orchestrator) maybeForceStartQueued(ctx context.Context, job *store.Job
 			"next_retry_at", nextRetry.Format(time.RFC3339Nano),
 			"error", err,
 		)
-		return nextRetry
+		return nextRetry, nil
 	}
 	job.Metadata.ForceStartAcceptedAt = &now
 	o.log.Info("force start queued job accepted",
@@ -323,7 +353,7 @@ func (o *Orchestrator) maybeForceStartQueued(ctx context.Context, job *store.Job
 		"source_type", job.SourceType,
 		"queued_id", queuedID,
 	)
-	return time.Time{}
+	return time.Time{}, nil
 }
 
 func supportsForceStart(sourceType store.SourceType) bool {

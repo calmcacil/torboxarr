@@ -57,9 +57,10 @@ Extend `store.SubmissionMetadata` with:
 QueuedAt                 *time.Time `json:"queued_at,omitempty"`
 ForceStartLastAttemptAt  *time.Time `json:"force_start_last_attempt_at,omitempty"`
 ForceStartAcceptedAt     *time.Time `json:"force_start_accepted_at,omitempty"`
+IgnoreQueueCreatedAt     bool       `json:"ignore_queue_created_at,omitempty"`
 ```
 
-These values belong to the current queued lifecycle and fit the existing JSON
+These fields belong to the current queued lifecycle and fit the existing JSON
 metadata model; no SQLite migration is required.
 
 `QueuedAt` is initialized when submission first transitions to
@@ -73,7 +74,12 @@ When `remote_active` is restored to `remote_queued`, determine whether the
 queue identity matches the prior lifecycle. If the queue ID is unchanged and
 force-start was already accepted, retain the lifecycle metadata. If the queue
 ID changed, reset the force-start lifecycle fields and initialize `QueuedAt`
-from the new queue entry or current time.
+from the new queue entry or current time. If an unchanged or incomplete queue
+identity has no accepted force-start proving continuity, start the reset
+lifecycle at the fresh queue confirmation rather than reusing the prior
+entry's `created_at`. Persist `IgnoreQueueCreatedAt` for that lifecycle so later
+polls and restarts cannot backdate `QueuedAt`; clear it for a concrete changed
+queue ID or a new submission.
 
 Do not clear accepted metadata merely because the queue entry disappears during
 the normal transition window. Terminal cleanup can leave historical metadata
@@ -127,7 +133,7 @@ serializes this decision with queue-to-active reconciliation.
 1. Refresh queue identifiers and initialize or preserve queued-lifecycle
    metadata.
 2. Persist the successful queue match if the feature is disabled, the threshold
-   has not elapsed, the queue ID is unavailable, an accepted request already
+   has not elapsed, the queue ID is unavailable, or an accepted request already
    exists.
 3. If eligible, call `ForceStartQueuedTask` before the normal queued update.
 4. On success, set `ForceStartLastAttemptAt` and `ForceStartAcceptedAt` to the
@@ -157,6 +163,10 @@ promotes the job.
 Continue using `UpdateJobIfState(..., remote_queued)` so an Arr removal that
 sets `delete_requested` wins over the post-request update. If the update affects
 zero rows, log that the response was ignored because local state changed.
+Re-read the local job immediately before the control request so a removal that
+completed during queue lookup prevents request initiation. A removal beginning
+after that check remains the unavoidable in-flight race described by Product
+Behavior 26.
 
 The existing claim mechanism prevents ordinary overlapping pollers in the
 supported single-service deployment from calling force-start concurrently. It
@@ -316,7 +326,8 @@ setting to disabled or the operator's chosen positive threshold after testing.
 - **TorBox slot pressure:** require an explicit operator threshold and send one
   item-specific request per eligible lifecycle.
 - **Removal race:** state-conditional persistence and `delete_requested = 0`
-  keep removal authoritative.
+  keep removal authoritative, while a fresh local-state check prevents a
+  request after removal completed during the queue lookup.
 
 ## Parallelization
 
@@ -338,5 +349,5 @@ full-suite validation from the same checkout.
   control request.
 - Historical queue recovery initializes `QueuedAt` from a valid queue
   timestamp or recovery observation rather than the local job creation time.
-- The three lifecycle timestamps round-trip through `metadata_json` and are
+- The lifecycle metadata round-trips through `metadata_json` and is
   documented in the README for operator inspection.

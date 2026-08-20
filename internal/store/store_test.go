@@ -119,7 +119,7 @@ func TestUpdateJob(t *testing.T) {
 	}
 }
 
-func TestJobMetadataRoundTripsForceStartTimestamps(t *testing.T) {
+func TestJobMetadataRoundTripsForceStartLifecycle(t *testing.T) {
 	st := newTestStore(t)
 	ctx := context.Background()
 	queuedAt := time.Date(2026, 8, 19, 12, 0, 0, 123456789, time.UTC)
@@ -129,6 +129,7 @@ func TestJobMetadataRoundTripsForceStartTimestamps(t *testing.T) {
 	job.Metadata.QueuedAt = &queuedAt
 	job.Metadata.ForceStartLastAttemptAt = &attemptedAt
 	job.Metadata.ForceStartAcceptedAt = &acceptedAt
+	job.Metadata.IgnoreQueueCreatedAt = true
 	if err := st.CreateJob(ctx, job); err != nil {
 		t.Fatal(err)
 	}
@@ -145,6 +146,9 @@ func TestJobMetadataRoundTripsForceStartTimestamps(t *testing.T) {
 		if pair[1] == nil || !pair[1].Equal(*pair[0]) {
 			t.Errorf("%s timestamp = %v, want %v", name, pair[1], pair[0])
 		}
+	}
+	if !got.Metadata.IgnoreQueueCreatedAt {
+		t.Fatal("IgnoreQueueCreatedAt = false, want persisted true")
 	}
 }
 

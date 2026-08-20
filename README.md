@@ -72,6 +72,8 @@ current confirmed queue lifecycle and does not change a job's Arr-visible state.
 For database diagnostics, the job's `metadata_json` records `queued_at`,
 `force_start_last_attempt_at`, and `force_start_accepted_at`; a non-null accepted
 timestamp means TorBox accepted the control request for that queue lifecycle.
+It may also record `ignore_queue_created_at` when a fresh active-to-queued
+lifecycle cannot safely reuse TorBox's older queue creation timestamp.
 
 Docker-specific runtime variables used by the bundled compose file. Set these to the same UID/GID that Sonarr and Radarr use on the host, so TorBoxarr can write to the same download and category folders:
 

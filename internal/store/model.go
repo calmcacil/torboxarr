@@ -69,6 +69,7 @@ type SubmissionMetadata struct {
 	QueuedAt                *time.Time `json:"queued_at,omitempty"`
 	ForceStartLastAttemptAt *time.Time `json:"force_start_last_attempt_at,omitempty"`
 	ForceStartAcceptedAt    *time.Time `json:"force_start_accepted_at,omitempty"`
+	IgnoreQueueCreatedAt    bool       `json:"ignore_queue_created_at,omitempty"`
 }
 
 type Job struct {

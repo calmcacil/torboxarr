@@ -102,10 +102,12 @@ func (o *Orchestrator) processSubmitJob(ctx context.Context, job *store.Job) err
 		job.Metadata.QueuedAt = &now
 		job.Metadata.ForceStartLastAttemptAt = nil
 		job.Metadata.ForceStartAcceptedAt = nil
+		job.Metadata.IgnoreQueueCreatedAt = false
 	} else {
 		job.Metadata.QueuedAt = nil
 		job.Metadata.ForceStartLastAttemptAt = nil
 		job.Metadata.ForceStartAcceptedAt = nil
+		job.Metadata.IgnoreQueueCreatedAt = false
 	}
 	nextRun := time.Now().UTC().Add(o.cfg.Workers.PollInterval)
 	job.NextRunAt = &nextRun
