@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode"
 
@@ -121,7 +122,7 @@ func runAddInputAt(ctx context.Context, baseURL string, input addInput) error {
 			return fmt.Errorf("TORBOXARR_SAB_API_KEY is not set; it must match the API key of the running TorBoxarr server")
 		}
 		return (&sabAddClient{
-			http:    &http.Client{Timeout: addRequestTimeout},
+			http:    newAddHTTPClient(nil),
 			baseURL: baseURL,
 			apiKey:  apiKey,
 		}).run(ctx, input.Category, input.NZBPath)
@@ -137,12 +138,22 @@ func runAddInputAt(ctx context.Context, baseURL string, input addInput) error {
 		return fmt.Errorf("cannot prepare HTTP session: %w", err)
 	}
 	client := &addClient{
-		http:     &http.Client{Jar: jar, Timeout: addRequestTimeout},
+		http:     newAddHTTPClient(jar),
 		baseURL:  baseURL,
 		username: "admin",
 		password: password,
 	}
 	return client.run(ctx, input.Category, input.Magnet, input.TorrentPath)
+}
+
+func newAddHTTPClient(jar http.CookieJar) *http.Client {
+	return &http.Client{
+		Jar:     jar,
+		Timeout: addRequestTimeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 }
 
 func addEndpoint(baseURL, path string) string {
@@ -305,16 +316,16 @@ func (c *addClient) submit(ctx context.Context, req *http.Request, confirmation 
 }
 
 func doAddSubmission(client *http.Client, req *http.Request, reachability, queueAdvice string) (*http.Response, error) {
-	wroteRequest := false
+	var wroteRequest atomic.Bool
 	trace := &httptrace.ClientTrace{
 		WroteRequest: func(httptrace.WroteRequestInfo) {
-			wroteRequest = true
+			wroteRequest.Store(true)
 		},
 	}
 	req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
 	resp, err := client.Do(req)
 	if err != nil {
-		if wroteRequest {
+		if wroteRequest.Load() {
 			return nil, fmt.Errorf("submission status is unknown: the request may have reached the server; %s", queueAdvice)
 		}
 		if interrupted(err) {
@@ -337,28 +348,10 @@ func validateMagnet(v string) error {
 	if err != nil || !strings.EqualFold(parsed.Scheme, "magnet") {
 		return fmt.Errorf("--magnet is not a valid magnet URI; expected magnet:?xt=urn:btih:<infohash>")
 	}
-
-	rawQuery := parsed.RawQuery
-	if rawQuery == "" && strings.HasPrefix(parsed.Opaque, "?") {
-		rawQuery = strings.TrimPrefix(parsed.Opaque, "?")
+	if _, ok := magnetBTIH(parsed); !ok {
+		return fmt.Errorf("--magnet must contain a non-empty BTIH exact-topic parameter")
 	}
-	query, err := url.ParseQuery(rawQuery)
-	if err != nil {
-		return fmt.Errorf("--magnet is not a valid magnet URI; expected magnet:?xt=urn:btih:<infohash>")
-	}
-	for key, values := range query {
-		if !strings.EqualFold(key, "xt") {
-			continue
-		}
-		for _, xt := range values {
-			xt = strings.TrimSpace(xt)
-			const prefix = "urn:btih:"
-			if strings.HasPrefix(strings.ToLower(xt), prefix) && strings.TrimSpace(xt[len(prefix):]) != "" {
-				return nil
-			}
-		}
-	}
-	return fmt.Errorf("--magnet must contain an xt=urn:btih:<infohash> parameter")
+	return nil
 }
 
 func magnetInfoHash(v string) string {
@@ -366,13 +359,20 @@ func magnetInfoHash(v string) string {
 	if err != nil {
 		return "unknown"
 	}
+	if infoHash, ok := magnetBTIH(parsed); ok {
+		return normalizeMagnetInfoHash(infoHash)
+	}
+	return "unknown"
+}
+
+func magnetBTIH(parsed *url.URL) (string, bool) {
 	rawQuery := parsed.RawQuery
 	if rawQuery == "" && strings.HasPrefix(parsed.Opaque, "?") {
 		rawQuery = strings.TrimPrefix(parsed.Opaque, "?")
 	}
 	query, err := url.ParseQuery(rawQuery)
 	if err != nil {
-		return "unknown"
+		return "", false
 	}
 	for key, values := range query {
 		if !strings.EqualFold(key, "xt") {
@@ -382,11 +382,14 @@ func magnetInfoHash(v string) string {
 			xt = strings.TrimSpace(xt)
 			const prefix = "urn:btih:"
 			if strings.HasPrefix(strings.ToLower(xt), prefix) {
-				return normalizeMagnetInfoHash(xt[len(prefix):])
+				infoHash := strings.TrimSpace(xt[len(prefix):])
+				if infoHash != "" {
+					return infoHash, true
+				}
 			}
 		}
 	}
-	return "unknown"
+	return "", false
 }
 
 func normalizeMagnetInfoHash(v string) string {
@@ -505,6 +508,10 @@ func validateNZBFile(path string) error {
 		case xml.CharData:
 			if depth == 0 && strings.TrimSpace(string(token)) != "" {
 				return fmt.Errorf("%s contains non-whitespace data outside the NZB document", path)
+			}
+		case xml.Directive, xml.ProcInst, xml.Comment:
+			if rootClosed {
+				return fmt.Errorf("%s has trailing XML after the NZB document", path)
 			}
 		}
 	}
@@ -713,6 +720,8 @@ func parseBencodeDict(data []byte, pos, depth int, hasInfo *bool) (int, bool) {
 		return 0, false
 	}
 	pos++
+	previousKey := ""
+	hasPreviousKey := false
 	for {
 		if pos >= len(data) {
 			return 0, false
@@ -726,6 +735,11 @@ func parseBencodeDict(data []byte, pos, depth int, hasInfo *bool) (int, bool) {
 		if !ok {
 			return 0, false
 		}
+		if hasPreviousKey && key <= previousKey {
+			return 0, false
+		}
+		previousKey = key
+		hasPreviousKey = true
 		if depth == 0 && key == "info" {
 			if pos >= len(data) || data[pos] != 'd' {
 				return 0, false

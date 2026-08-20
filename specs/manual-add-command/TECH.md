@@ -67,6 +67,8 @@ Preserve the existing qBittorrent flow:
 1. Validate the magnet or torrent file.
 2. Require `TORBOXARR_QBIT_PASSWORD`.
 3. Create a cookie jar and `http.Client` with the bounded add timeout.
+   Reject redirects so credentials and source data cannot leave the fixed local
+   server origin.
 4. `POST /api/v2/auth/login` with username `admin` and the configured password.
 5. `GET /api/v2/torrents/categories` and require an exact category key.
 6. Submit a magnet as URL-encoded `urls` and `category` fields to
@@ -96,6 +98,9 @@ jar or qBittorrent login:
 7. Treat HTTP 200 with `status: true` and one `nzo_ids` entry as accepted.
 8. Treat a false status, missing ID, non-2xx response, or unreadable JSON as a
    definitive rejection unless request delivery itself was uncertain.
+
+The SAB client also rejects redirects. This prevents API keys in request URLs
+or referrer metadata from being disclosed to a redirect target.
 
 The current server accepts `apikey` in query or form data. Prefer sending it in
 the query for multipart requests so authentication occurs before multipart
@@ -256,3 +261,6 @@ go test -race -count=1 -p 1 -parallel=1 ./...
 - Job creation and its initial event are atomic, submissions enter directly in
   the processable `submit_pending` state, and rejected or duplicate upload
   attempts clean their private payload directories.
+- Both compatibility clients reject redirects, request-write tracking is
+  race-safe, and local torrent/NZB parsers reject noncanonical dictionaries and
+  trailing XML metadata.

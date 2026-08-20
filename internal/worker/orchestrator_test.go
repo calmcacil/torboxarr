@@ -31,11 +31,10 @@ func newWorkerEnv(t *testing.T) *workerEnv {
 	t.Helper()
 	ctx := context.Background()
 
-	db, err := store.Open(ctx, ":memory:", 5*time.Second)
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "worker.db"), 5*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
-	db.SetMaxOpenConns(1) // :memory: creates a separate DB per connection
 	if err := store.RunMigrationsFS(db, store.EmbeddedMigrations); err != nil {
 		t.Fatal(err)
 	}

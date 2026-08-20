@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -279,8 +280,10 @@ func newAddTestClient(t *testing.T, baseURL string, timeout time.Duration) *addC
 	if err != nil {
 		t.Fatal(err)
 	}
+	httpClient := newAddHTTPClient(jar)
+	httpClient.Timeout = timeout
 	return &addClient{
-		http:     &http.Client{Jar: jar, Timeout: timeout},
+		http:     httpClient,
 		baseURL:  baseURL,
 		username: "admin",
 		password: "secret",
@@ -559,6 +562,49 @@ func TestRunAdd_ServerUnreachable(t *testing.T) {
 	}
 }
 
+func TestRunAdd_RejectsRedirectWithoutForwardingPassword(t *testing.T) {
+	forwarded := false
+	target := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		forwarded = true
+	}))
+	t.Cleanup(target.Close)
+	redirect := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusTemporaryRedirect)
+	}))
+	t.Cleanup(redirect.Close)
+	withAddPassword(t)
+
+	err := runAddAt(context.Background(), redirect.URL, "sonarr", "magnet:?xt=urn:btih:abc", "")
+	if err == nil || !strings.Contains(err.Error(), "authentication failed") {
+		t.Fatalf("expected definitive redirect rejection, got %v", err)
+	}
+	if forwarded {
+		t.Fatal("redirect target received qBittorrent credentials")
+	}
+}
+
+func TestRunAddNZB_RejectsRedirectWithoutForwardingAPIKey(t *testing.T) {
+	forwarded := false
+	target := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		forwarded = true
+	}))
+	t.Cleanup(target.Close)
+	redirect := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusTemporaryRedirect)
+	}))
+	t.Cleanup(redirect.Close)
+	withSABAPIKey(t)
+	path := writeTempNZB(t, `<nzb></nzb>`)
+
+	err := runAddInputAt(context.Background(), redirect.URL, addInput{Category: "tv", NZBPath: path})
+	if err == nil || !strings.Contains(err.Error(), "status 307") || strings.Contains(err.Error(), "sab-secret") {
+		t.Fatalf("expected redacted definitive redirect rejection, got %v", err)
+	}
+	if forwarded {
+		t.Fatal("redirect target received a SAB request")
+	}
+}
+
 func TestRunAdd_ServerRejected(t *testing.T) {
 	opts := defaultAddServerOptions()
 	opts.addBody = "Fails. Add rejected."
@@ -625,12 +671,30 @@ func TestRunAdd_CanceledStatusUnknown(t *testing.T) {
 	}
 }
 
+func TestRunAdd_CanceledAfterWriteIsUnknown(t *testing.T) {
+	client := &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		trace := httptrace.ContextClientTrace(req.Context())
+		trace.WroteRequest(httptrace.WroteRequestInfo{})
+		return nil, context.Canceled
+	})}
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, "http://127.0.0.1:8085/api/v2/torrents/add", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = doAddSubmission(client, req, "cannot reach", "Inspect the queue before retrying")
+	if err == nil || !strings.Contains(err.Error(), "status is unknown") || !strings.Contains(err.Error(), "Inspect the queue") {
+		t.Fatalf("expected uncertain post-write cancellation, got %v", err)
+	}
+}
+
 func TestValidateMagnet(t *testing.T) {
 	valid := []string{
 		"magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567",
 		"magnet:?dn=Movie&xt=urn:btih:abc&tr=https://tracker.example.com/announce",
 		"MAGNET:?XT=URN:BTIH:ABC",
 		"magnet://tracker.example.com?xt=urn:btih:abc",
+		"magnet:?xt=urn:btih:&xt=urn:btih:ABC",
 	}
 	for _, magnet := range valid {
 		if err := validateMagnet(magnet); err != nil {
@@ -651,6 +715,13 @@ func TestValidateMagnet(t *testing.T) {
 		if err := validateMagnet(magnet); err == nil {
 			t.Errorf("magnet %q: expected error", magnet)
 		}
+	}
+}
+
+func TestMagnetInfoHash_SkipsEmptyBTIH(t *testing.T) {
+	got := magnetInfoHash("magnet:?xt=urn:btih:&xt=urn:btih:ABC")
+	if got != "abc" {
+		t.Fatalf("magnetInfoHash = %q, want %q", got, "abc")
 	}
 }
 
@@ -678,6 +749,9 @@ func TestIsValidTorrent(t *testing.T) {
 		"d4:infod1:ai+3eee",
 		"d04:infodee",
 		"d4:infofoo:bare",
+		"d4:infode1:a1:xe",
+		"d4:infode4:infodee",
+		"d4:infod1:b1:x1:a1:yee",
 	}
 	for _, data := range invalid {
 		if isValidTorrent([]byte(data)) {
@@ -750,6 +824,9 @@ func TestValidateNZBFile(t *testing.T) {
 		"<nzb></nzb>trailing",
 		"<nzb></nzb><nzb></nzb>",
 		"prefix<nzb></nzb>",
+		"<nzb></nzb><!-- trailing -->",
+		"<nzb></nzb><?trailing value?>",
+		"<nzb></nzb><!trailing>",
 	}
 	for _, content := range invalid {
 		path := writeTempNZB(t, content)
