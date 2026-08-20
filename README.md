@@ -135,6 +135,23 @@ go build -o bin/torboxarr ./cmd/torboxarr
 
 Direct binary runs default to `/config/torboxarr.db`. If you want a different path for local development, set `TORBOXARR_DATABASE_PATH`.
 
+### Manual submissions
+
+The container-local `add` command submits one item through the running
+TorBoxarr service. Use an existing category and make file paths visible inside
+the container:
+
+```bash
+docker exec torboxarr torboxarr add --category tv --magnet 'magnet:?xt=urn:btih:<infohash>'
+docker exec torboxarr torboxarr add --category tv --torrent /path/to/file.torrent
+docker exec torboxarr torboxarr add --category tv --nzb /path/to/file.nzb
+```
+
+The command uses `TORBOXARR_QBIT_PASSWORD` for magnets and torrent files and
+`TORBOXARR_SAB_API_KEY` for NZB files. Exactly one source flag is required.
+Successful output means TorBoxarr accepted the item into its normal pipeline,
+not that the remote download has completed.
+
 The binary runs database migrations automatically on startup, so you don't need to run goose separately unless you want to manage migrations by hand:
 
 ```bash

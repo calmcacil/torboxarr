@@ -13,12 +13,13 @@ func TestSanitizeQuery_RedactsSensitiveValues(t *testing.T) {
 		"username": {"admin"},
 		"password": {"super-secret"},
 		"pass":     {"archive-secret"},
+		"urls":     {"magnet:?xt=urn:btih:secret&tr=private"},
 		"mode":     {"addurl"},
 	}
 
 	got := sanitizeQuery(values)
 
-	for _, key := range []string{"apikey", "nzbkey", "token", "username", "password", "pass"} {
+	for _, key := range []string{"apikey", "nzbkey", "token", "username", "password", "pass", "urls"} {
 		if got[key] != "[redacted]" {
 			t.Fatalf("%s = %q, want [redacted]", key, got[key])
 		}

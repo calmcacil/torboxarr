@@ -85,6 +85,29 @@ func TestCreateJob_DuplicateID(t *testing.T) {
 	}
 }
 
+func TestCreateJob_RollsBackWhenInitialEventFails(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	if _, err := st.DB().ExecContext(ctx, `
+        CREATE TRIGGER reject_initial_job_event
+        BEFORE INSERT ON job_events
+        BEGIN
+            SELECT RAISE(FAIL, 'event rejected');
+        END;
+    `); err != nil {
+		t.Fatal(err)
+	}
+
+	job := makeJob("rollback-001", "pub-rollback-001", store.StateSubmitPending)
+	if err := st.CreateJob(ctx, job); err == nil {
+		t.Fatal("expected initial event failure")
+	}
+	got, err := st.GetJobByID(ctx, job.ID)
+	if err != nil || got != nil {
+		t.Fatalf("GetJobByID = %+v, %v; want nil, nil", got, err)
+	}
+}
+
 // ─── UpdateJob ───────────────────────────────────────────────────────────────
 
 func TestUpdateJob(t *testing.T) {

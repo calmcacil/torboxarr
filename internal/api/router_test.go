@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/mrjoiny/torboxarr/internal/api"
 	"github.com/mrjoiny/torboxarr/internal/auth"
+	"github.com/mrjoiny/torboxarr/internal/compat"
 	"github.com/mrjoiny/torboxarr/internal/config"
 	"github.com/mrjoiny/torboxarr/internal/files"
 	"github.com/mrjoiny/torboxarr/internal/store"
@@ -26,6 +28,7 @@ type testEnv struct {
 	router  http.Handler
 	store   *store.Store
 	qbitMgr *auth.QBitSessionManager
+	layout  *files.Layout
 }
 
 func newTestEnv(t *testing.T) *testEnv {
@@ -70,6 +73,7 @@ func newTestEnvWithBaseURL(t *testing.T, baseURL string) *testEnv {
 		router:  srv.Router(),
 		store:   st,
 		qbitMgr: qbitMgr,
+		layout:  layout,
 	}
 }
 
@@ -270,6 +274,94 @@ func TestQBitAdd_URL(t *testing.T) {
 	}
 	if jobs[0].Category != "movies" {
 		t.Errorf("Category = %q, want %q", jobs[0].Category, "movies")
+	}
+}
+
+func TestQBitAdd_DuplicateReturnsSuccess(t *testing.T) {
+	env := newTestEnv(t)
+	sid := env.loginQBit(t)
+	fields := map[string]string{
+		"urls":     "magnet:?xt=urn:btih:aaaa1111bbbb2222cccc3333dddd4444eeee5555",
+		"category": "movies",
+	}
+
+	for i := 0; i < 2; i++ {
+		rec := env.qbitMultipartAdd(t, sid, fields)
+		if rec.Code != http.StatusOK || rec.Body.String() != "Ok." {
+			t.Fatalf("submission %d = status %d body %q, want 200 Ok.", i+1, rec.Code, rec.Body.String())
+		}
+	}
+	jobs, err := env.store.ListVisibleClientJobs(context.Background(), store.ClientKindQBit, "movies", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("duplicate submission created %d jobs, want 1", len(jobs))
+	}
+}
+
+func TestQBitAdd_CreateFailureRemovesPayload(t *testing.T) {
+	env := newTestEnv(t)
+	sid := env.loginQBit(t)
+	if _, err := env.store.DB().Exec(`
+        CREATE TRIGGER reject_api_job_event
+        BEFORE INSERT ON job_events
+        BEGIN
+            SELECT RAISE(FAIL, 'event rejected');
+        END;
+    `); err != nil {
+		t.Fatal(err)
+	}
+
+	var body bytes.Buffer
+	w := multipart.NewWriter(&body)
+	if err := w.WriteField("category", "movies"); err != nil {
+		t.Fatal(err)
+	}
+	part, err := w.CreateFormFile("torrents", "sample.torrent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := part.Write([]byte("torrent payload")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	rec := env.qbitRequest(t, http.MethodPost, "/api/v2/torrents/add", &body, w.FormDataContentType(), sid)
+	if rec.Code != http.StatusOK || rec.Body.String() != "Fails." {
+		t.Fatalf("response = %d %q, want 200 Fails.", rec.Code, rec.Body.String())
+	}
+	entries, err := os.ReadDir(env.layout.Payloads)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("failed submission left %d payload directories", len(entries))
+	}
+}
+
+func TestQBitAdd_URLDoesNotPersistMagnetAsDisplayName(t *testing.T) {
+	env := newTestEnv(t)
+	sid := env.loginQBit(t)
+	magnet := "magnet:?xt=urn:btih:not-a-canonical-hash&tr=https%3A%2F%2Fsecret.example%2Fannounce%3Ftoken%3Dprivate"
+	rec := env.qbitMultipartAdd(t, sid, map[string]string{
+		"urls":     magnet,
+		"category": "movies",
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	jobs, err := env.store.ListVisibleClientJobs(context.Background(), store.ClientKindQBit, "movies", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("got %d jobs, want 1", len(jobs))
+	}
+	if strings.Contains(jobs[0].DisplayName, "magnet:") || strings.Contains(jobs[0].DisplayName, "secret") {
+		t.Fatalf("display name leaked source URI: %q", jobs[0].DisplayName)
 	}
 }
 
@@ -698,6 +790,65 @@ func TestSABAddURL_NoAuth(t *testing.T) {
 	if rec.Code != http.StatusForbidden {
 		t.Errorf("status = %d, want %d for missing API key", rec.Code, http.StatusForbidden)
 	}
+}
+
+func TestSABAddFile_RejectsOversizedRequestBeforePersistence(t *testing.T) {
+	env := newTestEnv(t)
+	req := httptest.NewRequest(http.MethodPost, "/sabnzbd/api?mode=addfile&apikey=sabapikey123", strings.NewReader("oversized"))
+	req.Header.Set("Content-Type", "multipart/form-data; boundary=unused")
+	req.ContentLength = compat.MaxSABUploadBytes + 1
+	rec := httptest.NewRecorder()
+	env.router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusRequestEntityTooLarge)
+	}
+	jobs, err := env.store.ListVisibleClientJobs(context.Background(), store.ClientKindSAB, "", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 0 {
+		t.Fatalf("got %d persisted jobs, want none", len(jobs))
+	}
+}
+
+func TestSABAddFile_RejectsChunkedOversizedRequest(t *testing.T) {
+	env := newTestEnv(t)
+	boundary := "oversized-boundary"
+	var prefix bytes.Buffer
+	w := multipart.NewWriter(&prefix)
+	if err := w.SetBoundary(boundary); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.CreateFormFile("nzbfile", "large.nzb"); err != nil {
+		t.Fatal(err)
+	}
+	header := append([]byte(nil), prefix.Bytes()...)
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	trailer := append([]byte(nil), prefix.Bytes()[len(header):]...)
+	body := io.MultiReader(
+		bytes.NewReader(header),
+		io.LimitReader(zeroReader{}, compat.MaxSABUploadBytes),
+		bytes.NewReader(trailer),
+	)
+	req := httptest.NewRequest(http.MethodPost, "/sabnzbd/api?mode=addfile&apikey=sabapikey123", body)
+	req.Header.Set("Content-Type", "multipart/form-data; boundary="+boundary)
+	req.ContentLength = -1
+	rec := httptest.NewRecorder()
+	env.router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusRequestEntityTooLarge)
+	}
+}
+
+type zeroReader struct{}
+
+func (zeroReader) Read(p []byte) (int, error) {
+	clear(p)
+	return len(p), nil
 }
 
 func TestSABQueue(t *testing.T) {

@@ -1,6 +1,8 @@
 package files_test
 
 import (
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -8,6 +10,12 @@ import (
 
 	"github.com/mrjoiny/torboxarr/internal/files"
 )
+
+type failingReader struct{}
+
+func (failingReader) Read([]byte) (int, error) {
+	return 0, errors.New("read failed")
+}
 
 func TestStagingPathForJob(t *testing.T) {
 	tmpDir := t.TempDir()
@@ -95,6 +103,22 @@ func TestSavePayload(t *testing.T) {
 	}
 	if string(data) != content {
 		t.Errorf("file content = %q, want %q", string(data), content)
+	}
+}
+
+func TestSavePayload_RemovesPartialPayloadOnReadError(t *testing.T) {
+	tmpDir := t.TempDir()
+	layout := files.NewLayout(tmpDir,
+		filepath.Join(tmpDir, "staging"),
+		filepath.Join(tmpDir, "completed"),
+		filepath.Join(tmpDir, "payloads"),
+	)
+
+	if _, _, err := layout.SavePayload("job-failed", "test.nzb", io.MultiReader(strings.NewReader("partial"), failingReader{})); err == nil {
+		t.Fatal("expected payload write error")
+	}
+	if _, err := os.Stat(layout.PayloadDirForJob("job-failed")); !os.IsNotExist(err) {
+		t.Fatalf("partial payload directory still exists: %v", err)
 	}
 }
 

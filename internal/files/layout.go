@@ -88,18 +88,25 @@ func truncateName(name string, maxBytes int) string {
 
 func (l *Layout) SavePayload(jobID, name string, reader io.Reader) (string, string, error) {
 	path := l.PayloadPathForJob(jobID, name)
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", "", fmt.Errorf("ensure payload parent: %w", err)
 	}
 	file, err := os.Create(path)
 	if err != nil {
+		_ = os.RemoveAll(dir)
 		return "", "", fmt.Errorf("create payload file: %w", err)
 	}
-	defer file.Close()
 
 	h := sha256.New()
 	if _, err := io.Copy(io.MultiWriter(file, h), reader); err != nil {
+		_ = file.Close()
+		_ = os.RemoveAll(dir)
 		return "", "", fmt.Errorf("write payload file: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		_ = os.RemoveAll(dir)
+		return "", "", fmt.Errorf("close payload file: %w", err)
 	}
 	return path, hex.EncodeToString(h.Sum(nil)), nil
 }

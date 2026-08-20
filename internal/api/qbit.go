@@ -154,7 +154,7 @@ func (s *Server) handleQBitAdd(w http.ResponseWriter, r *http.Request) {
 			infoHash := extractInfoHash(line)
 			displayName := rename
 			if displayName == "" {
-				displayName = firstNonEmpty(infoHash, line)
+				displayName = firstNonEmpty(infoHash, "torrent")
 			}
 			if _, _, err := s.enqueueSubmission(r.Context(), SubmissionRequest{
 				SourceType:  store.SourceTypeTorrent,
@@ -168,7 +168,8 @@ func (s *Server) handleQBitAdd(w http.ResponseWriter, r *http.Request) {
 				created++
 			} else {
 				s.log.Warn("qbit url submission failed",
-					"url", line,
+					"source_type", store.SourceTypeTorrent,
+					"info_hash", infoHash,
 					"category", category,
 					"error", err.Error(),
 				)
