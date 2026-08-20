@@ -43,6 +43,27 @@ func (s JobState) Closed() bool {
 	}
 }
 
+// UpstreamRemovalProgress records independently persisted cleanup progress for
+// one TorBox representation of a job. A terminal outcome is never retried.
+type UpstreamRemovalProgress struct {
+	Attempts    int        `json:"attempts,omitempty"`
+	CompletedAt *time.Time `json:"completed_at,omitempty"`
+	Outcome     string     `json:"outcome,omitempty"`
+	LastError   string     `json:"last_error,omitempty"`
+}
+
+const (
+	UpstreamRemovalDeleted        = "deleted"
+	UpstreamRemovalAbsent         = "absent"
+	UpstreamRemovalRejected       = "rejected"
+	UpstreamRemovalExhausted      = "exhausted"
+	UpstreamRemovalUnidentifiable = "unidentifiable"
+)
+
+func (p UpstreamRemovalProgress) Terminal() bool {
+	return p.Outcome != ""
+}
+
 type SubmissionMetadata struct {
 	SavePath         string   `json:"save_path,omitempty"`
 	Rename           string   `json:"rename,omitempty"`
@@ -56,10 +77,12 @@ type SubmissionMetadata struct {
 	AddOnlyIfCached  bool     `json:"add_only_if_cached,omitempty"`
 	UploadedFilename string   `json:"uploaded_filename,omitempty"`
 	OriginalFilename string   `json:"original_filename,omitempty"`
-	// UpstreamDeleteAttempts tracks how many times the upstream TorBox delete
-	// has been attempted (and failed retryably) for this job. Used to cap
-	// retries so a prolonged TorBox outage doesn't wedge the job forever.
+	// UpstreamDeleteAttempts is retained only so metadata written by older
+	// versions can be migrated. New writes use the per-view progress below.
 	UpstreamDeleteAttempts int `json:"upstream_delete_attempts,omitempty"`
+
+	ActiveRemoval UpstreamRemovalProgress `json:"active_removal,omitempty"`
+	QueuedRemoval UpstreamRemovalProgress `json:"queued_removal,omitempty"`
 
 	// PollAttempts tracks how many consecutive retryable poll failures this job
 	// has seen. Used to cap retries so a job whose upstream task no longer

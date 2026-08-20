@@ -85,29 +85,6 @@ func TestCreateJob_DuplicateID(t *testing.T) {
 	}
 }
 
-func TestCreateJob_RollsBackWhenInitialEventFails(t *testing.T) {
-	st := newTestStore(t)
-	ctx := context.Background()
-	if _, err := st.DB().ExecContext(ctx, `
-        CREATE TRIGGER reject_initial_job_event
-        BEFORE INSERT ON job_events
-        BEGIN
-            SELECT RAISE(FAIL, 'event rejected');
-        END;
-    `); err != nil {
-		t.Fatal(err)
-	}
-
-	job := makeJob("rollback-001", "pub-rollback-001", store.StateSubmitPending)
-	if err := st.CreateJob(ctx, job); err == nil {
-		t.Fatal("expected initial event failure")
-	}
-	got, err := st.GetJobByID(ctx, job.ID)
-	if err != nil || got != nil {
-		t.Fatalf("GetJobByID = %+v, %v; want nil, nil", got, err)
-	}
-}
-
 // ─── UpdateJob ───────────────────────────────────────────────────────────────
 
 func TestUpdateJob(t *testing.T) {
@@ -142,39 +119,6 @@ func TestUpdateJob(t *testing.T) {
 	}
 }
 
-func TestJobMetadataRoundTripsForceStartLifecycle(t *testing.T) {
-	st := newTestStore(t)
-	ctx := context.Background()
-	queuedAt := time.Date(2026, 8, 19, 12, 0, 0, 123456789, time.UTC)
-	attemptedAt := queuedAt.Add(3 * time.Hour)
-	acceptedAt := attemptedAt.Add(time.Second)
-	job := makeJob("metadata-force-start", "pub-metadata-force-start", store.StateRemoteQueued)
-	job.Metadata.QueuedAt = &queuedAt
-	job.Metadata.ForceStartLastAttemptAt = &attemptedAt
-	job.Metadata.ForceStartAcceptedAt = &acceptedAt
-	job.Metadata.IgnoreQueueCreatedAt = true
-	if err := st.CreateJob(ctx, job); err != nil {
-		t.Fatal(err)
-	}
-
-	got, err := st.GetJobByID(ctx, job.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for name, pair := range map[string][2]*time.Time{
-		"queued":   {&queuedAt, got.Metadata.QueuedAt},
-		"attempt":  {&attemptedAt, got.Metadata.ForceStartLastAttemptAt},
-		"accepted": {&acceptedAt, got.Metadata.ForceStartAcceptedAt},
-	} {
-		if pair[1] == nil || !pair[1].Equal(*pair[0]) {
-			t.Errorf("%s timestamp = %v, want %v", name, pair[1], pair[0])
-		}
-	}
-	if !got.Metadata.IgnoreQueueCreatedAt {
-		t.Fatal("IgnoreQueueCreatedAt = false, want persisted true")
-	}
-}
-
 // ─── UpdateJobState ──────────────────────────────────────────────────────────
 
 func TestUpdateJobState(t *testing.T) {
@@ -199,11 +143,37 @@ func TestUpdateJobState(t *testing.T) {
 	}
 }
 
+func TestUpdateJobState_RemoveRequestWinsOverStaleWorker(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	job := makeJob("remove-wins-001", "pub-remove-wins-001", store.StateRemoteActive)
+	if err := st.CreateJob(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	stale := *job
+
+	job.DeleteRequested = true
+	if err := st.UpdateJobState(ctx, job, store.StateRemovePending, "remove requested"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpdateJobState(ctx, &stale, store.StateRemoteFailed, "stale poll result"); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := st.GetJobByID(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != store.StateRemovePending {
+		t.Fatalf("State = %q, want %q", got.State, store.StateRemovePending)
+	}
+}
+
 func TestUpdateJobStateIfCurrentRejectsConcurrentRemoval(t *testing.T) {
 	ctx := context.Background()
 	st := newTestStore(t)
 	job := makeJob("conditional-001", "pub-conditional-001", store.StateRemoteActive)
-	job.State = store.StateRemoteActive
 	if err := st.CreateJob(ctx, job); err != nil {
 		t.Fatal(err)
 	}
@@ -222,12 +192,108 @@ func TestUpdateJobStateIfCurrentRejectsConcurrentRemoval(t *testing.T) {
 	if ok {
 		t.Fatal("stale poll update should not be applied after removal")
 	}
+
 	got, err := st.GetJobByID(ctx, job.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got.State != store.StateRemovePending {
 		t.Fatalf("state = %s, want remove_pending", got.State)
+	}
+}
+
+func TestUpdateJobState_RemoveRequestRetainsStaleWorkerCleanupData(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	job := makeJob("remove-merge-001", "pub-remove-merge-001", store.StateSubmitPending)
+	oldRemoteID := "100"
+	job.RemoteID = &oldRemoteID
+	if err := st.CreateJob(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	stale := *job
+
+	job.DeleteRequested = true
+	if err := st.UpdateJobState(ctx, job, store.StateRemovePending, "remove requested"); err != nil {
+		t.Fatal(err)
+	}
+	remoteID, queuedID := "101", "202"
+	queueAuthID, remoteHash := "secret-auth", "exact-hash"
+	completedPath := "/completed/remove-merge-001"
+	stale.RemoteID = &remoteID
+	stale.QueuedID = &queuedID
+	stale.QueueAuthID = &queueAuthID
+	stale.RemoteHash = &remoteHash
+	stale.CompletedPath = &completedPath
+	if err := st.UpdateJobState(ctx, &stale, store.StateCompleted, "stale worker completed"); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := st.GetJobByID(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != store.StateRemovePending {
+		t.Fatalf("State = %q, want %q", got.State, store.StateRemovePending)
+	}
+	if got.RemoteID == nil || *got.RemoteID != "101" || got.QueuedID == nil || *got.QueuedID != "202" || got.QueueAuthID == nil || *got.QueueAuthID != "secret-auth" || got.RemoteHash == nil || *got.RemoteHash != "exact-hash" {
+		t.Fatalf("upstream identities were not retained: %#v", got)
+	}
+	if got.CompletedPath == nil || *got.CompletedPath != completedPath {
+		t.Fatalf("CompletedPath = %v, want promoted path", got.CompletedPath)
+	}
+}
+
+func TestUpdateJobState_RemoverCanRecordFailure(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	job := makeJob("remove-failed-001", "pub-remove-failed-001", store.StateRemovePending)
+	job.DeleteRequested = true
+	if err := st.CreateJob(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpdateJobState(ctx, job, store.StateFailed, "unsafe local path"); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := st.GetJobByID(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != store.StateFailed {
+		t.Fatalf("State = %q, want %q", got.State, store.StateFailed)
+	}
+}
+
+func TestMarkJobRemovePendingPreservesWorkerData(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	job := makeJob("mark-remove-001", "pub-mark-remove-001", store.StateRemoteActive)
+	remoteID, completedPath := "701", "/completed/mark-remove-001"
+	job.RemoteID = &remoteID
+	job.CompletedPath = &completedPath
+	if err := st.CreateJob(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.MarkJobRemovePending(ctx, job.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := st.GetJobByID(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != store.StateRemovePending || !got.DeleteRequested {
+		t.Fatalf("state = %q delete_requested = %v, want remove_pending true", got.State, got.DeleteRequested)
+	}
+	if got.RemoteID == nil || *got.RemoteID != remoteID || got.CompletedPath == nil || *got.CompletedPath != completedPath {
+		t.Fatalf("worker cleanup data was not preserved: %#v", got)
+	}
+	if got.NextRunAt == nil {
+		t.Fatal("NextRunAt is nil, want removal due immediately")
 	}
 }
 

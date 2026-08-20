@@ -14,9 +14,11 @@ type Client interface {
 	FindQueuedTask(ctx context.Context, sourceType string, queuedID, queueAuthID, remoteHash string) (*TaskStatus, error)
 	GetTaskStatus(ctx context.Context, sourceType string, remoteID string) (*TaskStatus, error)
 	FindActiveTask(ctx context.Context, sourceType string, remoteID, queueAuthID, remoteHash string) (*TaskStatus, error)
+	FindActiveTaskByIdentity(ctx context.Context, sourceType string, remoteID, queuedID, queueAuthID, remoteHash string) (*TaskStatus, error)
 	ForceStartQueuedTask(ctx context.Context, sourceType, queuedID string) error
 	GetDownloadLinks(ctx context.Context, sourceType string, remoteID string) ([]DownloadAsset, error)
 	DeleteTask(ctx context.Context, sourceType string, remoteID string) error
+	DeleteQueuedTask(ctx context.Context, sourceType string, queuedID string) error
 }
 
 type CreateTorrentTaskRequest struct {
@@ -88,6 +90,39 @@ type RetryableError struct {
 	Err error
 }
 
+// RequestNotSentError reports a failure before an HTTP request was issued.
+// Callers may retry it, but it must not consume an uncertain-request budget.
+type RequestNotSentError struct {
+	Err error
+}
+
+func (e *RequestNotSentError) Error() string {
+	return e.Err.Error()
+}
+
+func (e *RequestNotSentError) Unwrap() error {
+	return e.Err
+}
+
+func IsRequestNotSent(err error) bool {
+	var notSent *RequestNotSentError
+	return errors.As(err, &notSent)
+}
+
+type HTTPStatusError struct {
+	StatusCode int
+	Message    string
+}
+
+func (e *HTTPStatusError) Error() string {
+	return e.Message
+}
+
+func IsHTTPStatus(err error, status int) bool {
+	var statusErr *HTTPStatusError
+	return errors.As(err, &statusErr) && statusErr.StatusCode == status
+}
+
 func (e *RetryableError) Error() string {
 	return e.Err.Error()
 }
@@ -109,7 +144,7 @@ func MarkRetryable(err error) error {
 
 func IsRetryable(err error) bool {
 	var retryable *RetryableError
-	return errors.As(err, &retryable)
+	return errors.As(err, &retryable) || IsRequestNotSent(err)
 }
 
 // ErrTorboxLogical indicates the TorBox API returned a structured error in its
@@ -133,6 +168,43 @@ func (e *ErrTorboxLogical) Unwrap() error {
 func IsTorboxLogical(err error) bool {
 	var logical *ErrTorboxLogical
 	return errors.As(err, &logical)
+}
+
+// ErrTorboxAbsent means the requested upstream representation is already gone.
+// It is intentionally distinct from a generic non-retryable API error so
+// deletion callers can make the operation idempotent.
+type ErrTorboxAbsent struct {
+	Err error
+}
+
+func (e *ErrTorboxAbsent) Error() string {
+	return e.Err.Error()
+}
+
+func (e *ErrTorboxAbsent) Unwrap() error {
+	return e.Err
+}
+
+func IsTorboxAbsent(err error) bool {
+	var absent *ErrTorboxAbsent
+	return errors.As(err, &absent)
+}
+
+type ErrTorboxIdentityConflict struct {
+	Err error
+}
+
+func (e *ErrTorboxIdentityConflict) Error() string {
+	return e.Err.Error()
+}
+
+func (e *ErrTorboxIdentityConflict) Unwrap() error {
+	return e.Err
+}
+
+func IsTorboxIdentityConflict(err error) bool {
+	var conflict *ErrTorboxIdentityConflict
+	return errors.As(err, &conflict)
 }
 
 func RequireRemoteID(remoteID string) error {

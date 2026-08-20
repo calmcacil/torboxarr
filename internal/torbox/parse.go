@@ -20,7 +20,7 @@ func parseCreateTask(env *apiEnvelope, asQueued bool) (*CreateTaskResponse, erro
 	if err := json.Unmarshal(env.Data, &object); err == nil {
 		activeID := extractActiveID("", object, false)
 		queuedID := firstString(object, "queued_id", "queue_id")
-		if activeID == "" {
+		if activeID == "" && queuedID == "" {
 			queuedID = extractQueuedID(object)
 		}
 		return &CreateTaskResponse{
@@ -131,13 +131,13 @@ func parseTaskStatus(sourceType string, item map[string]any, active bool) *TaskS
 	failed := (stateFailed || labelFailed) && !downloadReady
 	inactive := label == "inactive" || firstBool(item, "inactive")
 
-	remoteID := ""
-	if active {
-		remoteID = extractActiveID(sourceType, item, true)
-	}
+	// A queued item's generic id is its queue control ID. Explicit active ID
+	// fields still indicate that TorBox promoted the item between views.
+	remoteID := extractActiveID(sourceType, item, active)
+
 	return &TaskStatus{
 		RemoteID:         remoteID,
-		QueuedID:         extractQueuedID(item),
+		QueuedID:         extractQueueReferenceID(item),
 		QueueAuthID:      extractQueueAuthID(sourceType, item),
 		Hash:             firstString(item, "hash"),
 		Name:             firstString(item, "name", "filename", "title"),
@@ -177,6 +177,10 @@ func queueCreatedAt(item map[string]any, active bool) *time.Time {
 
 func extractQueuedID(item map[string]any) string {
 	return firstString(item, "queued_id", "queue_id", "id")
+}
+
+func extractQueueReferenceID(item map[string]any) string {
+	return firstString(item, "queued_id", "queue_id")
 }
 
 func extractActiveID(sourceType string, item map[string]any, allowGenericID bool) string {

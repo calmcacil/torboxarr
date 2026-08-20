@@ -93,9 +93,10 @@ func (o *Orchestrator) findActive(ctx context.Context, job *store.Job) (*torbox.
 	if remoteID == "" && deref(job.RemoteHash) == "" && deref(job.QueueAuthID) == "" {
 		return nil, fmt.Errorf("no remote identity available for active lookup")
 	}
-	return o.torbox.FindActiveTask(ctx,
+	return o.torbox.FindActiveTaskByIdentity(ctx,
 		string(job.SourceType),
 		remoteID,
+		deref(job.QueuedID),
 		deref(job.QueueAuthID),
 		deref(job.RemoteHash),
 	)

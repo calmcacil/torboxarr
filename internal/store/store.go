@@ -197,8 +197,7 @@ func (s *Store) UpdateJob(ctx context.Context, job *Job) error {
 }
 
 // UpdateJobIfState persists a job only while it remains in expectedState and
-// has not been claimed for removal. This prevents an in-flight remote poll
-// from overwriting a concurrent remove request.
+// has not been claimed for removal.
 func (s *Store) UpdateJobIfState(ctx context.Context, job *Job, expectedState JobState) (bool, error) {
 	affected, err := s.updateJob(ctx, job, " AND state = ? AND delete_requested = 0", []any{string(expectedState)})
 	return affected == 1, err
@@ -236,7 +235,11 @@ func (s *Store) updateJob(ctx context.Context, job *Job, where string, whereArgs
         SET source_type = ?,
             client_kind = ?,
             category = ?,
-            state = ?,
+            state = CASE
+                WHEN state = 'removed' THEN 'removed'
+                WHEN delete_requested = 1 AND ? NOT IN ('remove_pending', 'removed') AND ? = 0 THEN 'remove_pending'
+                ELSE ?
+            END,
             submission_key = ?,
             remote_id = ?,
             queued_id = ?,
@@ -255,15 +258,21 @@ func (s *Store) updateJob(ctx context.Context, job *Job, where string, whereArgs
             next_run_at = ?,
             last_remote_status = ?,
             metadata_json = ?,
-            delete_requested = ?,
-            claimed_by = NULL,
-            claimed_at = NULL,
+            delete_requested = CASE WHEN delete_requested = 1 THEN 1 ELSE ? END,
             updated_at = ?
-         WHERE id = ?` + where
+        WHERE id = ?
+          AND (state != 'removed' OR ? IN ('removed'))
+          AND (
+              delete_requested = 0 OR
+              ? IN ('remove_pending', 'removed') OR
+              (? = 'failed' AND ? = 1)
+		  )` + where
 	args := []any{
 		string(job.SourceType),
 		string(job.ClientKind),
 		job.Category,
+		string(job.State),
+		boolToInt(job.DeleteRequested),
 		string(job.State),
 		job.SubmissionKey,
 		nullableString(job.RemoteID),
@@ -286,6 +295,10 @@ func (s *Store) updateJob(ctx context.Context, job *Job, where string, whereArgs
 		boolToInt(job.DeleteRequested),
 		formatTime(job.UpdatedAt),
 		job.ID,
+		string(job.State),
+		string(job.State),
+		string(job.State),
+		boolToInt(job.DeleteRequested),
 	}
 	args = append(args, whereArgs...)
 	result, err := s.execWrite(ctx, query, args...)
@@ -300,10 +313,69 @@ func (s *Store) UpdateJobState(ctx context.Context, job *Job, next JobState, mes
 	prev := job.State
 	job.State = next
 	job.UpdatedAt = s.now()
-	if err := s.UpdateJob(ctx, job); err != nil {
+	affected, err := s.updateJob(ctx, job, "", nil)
+	if err != nil {
 		return err
 	}
+	if affected == 0 {
+		var persistedState string
+		if err := s.db.QueryRowContext(ctx, `SELECT state FROM jobs WHERE id = ?`, job.ID).Scan(&persistedState); err != nil {
+			return fmt.Errorf("read persisted job state: %w", err)
+		}
+		job.State = JobState(persistedState)
+		if job.State == StateRemovePending {
+			// A worker may finish an external create or local promotion after a
+			// removal request wins. Preserve only cleanup-critical discoveries;
+			// never let the stale worker revive or otherwise rewrite the job.
+			if _, err := s.execWrite(ctx, `
+                UPDATE jobs
+                SET remote_id = COALESCE(NULLIF(?, ''), remote_id),
+                    queued_id = COALESCE(NULLIF(?, ''), queued_id),
+                    queue_auth_id = COALESCE(NULLIF(?, ''), queue_auth_id),
+                    remote_hash = COALESCE(NULLIF(?, ''), remote_hash),
+                    completed_path = COALESCE(NULLIF(?, ''), completed_path),
+                    updated_at = ?
+                WHERE id = ? AND state = 'remove_pending'
+            `,
+				nullableString(job.RemoteID),
+				nullableString(job.QueuedID),
+				nullableString(job.QueueAuthID),
+				nullableString(job.RemoteHash),
+				nullableString(job.CompletedPath),
+				formatTime(s.now()),
+				job.ID,
+			); err != nil {
+				return fmt.Errorf("merge stale worker cleanup data: %w", err)
+			}
+		}
+		return nil
+	}
+	// A remove request can race with another worker that already loaded the
+	// job. UpdateJob's state guard keeps remove_pending authoritative; avoid
+	// emitting a misleading event when that guard wins.
 	return s.AppendEvent(ctx, job.ID, &prev, &next, message)
+}
+
+func (s *Store) MarkJobRemovePending(ctx context.Context, id string) error {
+	now := s.now()
+	result, err := s.execWrite(ctx, `
+        UPDATE jobs
+        SET state = 'remove_pending',
+            delete_requested = 1,
+            next_run_at = ?,
+            error_message = NULL,
+            updated_at = ?
+        WHERE id = ? AND state NOT IN ('remove_pending', 'removed')
+    `, formatTime(now), formatTime(now), id)
+	if err != nil {
+		return fmt.Errorf("mark job remove pending: %w", err)
+	}
+	affected, _ := result.RowsAffected()
+	if affected == 0 {
+		return nil
+	}
+	to := StateRemovePending
+	return s.AppendEvent(ctx, id, nil, &to, "remove requested via Arr-compatible API")
 }
 
 func (s *Store) AppendEvent(ctx context.Context, jobID string, from, to *JobState, message string) error {
@@ -356,6 +428,28 @@ func (s *Store) GetJobByPublicID(ctx context.Context, publicID string) (*Job, er
 		return nil, nil
 	}
 	return job, err
+}
+
+// ListRemoteFailedWithQueueTracking returns historical failures that may have
+// been misclassified while a TorBox task was still queued.
+func (s *Store) ListRemoteFailedWithQueueTracking(ctx context.Context) ([]*Job, error) {
+	rows, err := s.db.QueryContext(ctx, `
+        SELECT `+jobColumns+`
+        FROM jobs
+        WHERE state = 'remote_failed'
+          AND (queued_id IS NOT NULL OR queue_auth_id IS NOT NULL OR remote_hash IS NOT NULL)
+          AND error_message IS NOT NULL
+          AND (
+              error_message LIKE 'poll failed after max attempts; upstream task unrecoverable%'
+              OR error_message LIKE 'remote task not found in TorBox queue or active list%'
+          )
+        ORDER BY updated_at ASC
+    `)
+	if err != nil {
+		return nil, fmt.Errorf("list remote failed queued jobs: %w", err)
+	}
+	defer rows.Close()
+	return scanJobs(rows)
 }
 
 func (s *Store) ListVisibleClientJobs(ctx context.Context, clientKind ClientKind, category string, limit int) ([]*Job, error) {
@@ -417,28 +511,6 @@ func (s *Store) ListOpenJobs(ctx context.Context) ([]*Job, error) {
     `)
 	if err != nil {
 		return nil, fmt.Errorf("list open jobs: %w", err)
-	}
-	defer rows.Close()
-	return scanJobs(rows)
-}
-
-// ListRemoteFailedWithQueueTracking returns historical failures that may have
-// been misclassified while a TorBox task was still queued.
-func (s *Store) ListRemoteFailedWithQueueTracking(ctx context.Context) ([]*Job, error) {
-	rows, err := s.db.QueryContext(ctx, `
-        SELECT `+jobColumns+`
-		FROM jobs
-		WHERE state = 'remote_failed'
-		  AND (queued_id IS NOT NULL OR queue_auth_id IS NOT NULL OR remote_hash IS NOT NULL)
-		  AND error_message IS NOT NULL
-		  AND (
-		      error_message LIKE 'poll failed after max attempts; upstream task unrecoverable%'
-		      OR error_message LIKE 'remote task not found in TorBox queue or active list%'
-		  )
-        ORDER BY updated_at ASC
-    `)
-	if err != nil {
-		return nil, fmt.Errorf("list remote failed queued jobs: %w", err)
 	}
 	defer rows.Close()
 	return scanJobs(rows)

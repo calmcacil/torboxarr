@@ -123,122 +123,161 @@ func (c *HTTPClient) GetTaskStatus(ctx context.Context, sourceType string, remot
 }
 
 func (c *HTTPClient) GetQueuedStatus(ctx context.Context, sourceType string, queuedID string) (*TaskStatus, error) {
-	if strings.TrimSpace(queuedID) == "" {
-		return nil, fmt.Errorf("queued id is required")
-	}
+	c.debug("fetching torbox queued status", "source_type", sourceType, "queued_id", queuedID)
 	return c.FindQueuedTask(ctx, sourceType, queuedID, "", "")
 }
 
-func (c *HTTPClient) FindQueuedTask(ctx context.Context, sourceType, queuedID, queueAuthID, remoteHash string) (*TaskStatus, error) {
-	c.debug("fetching torbox queued status", "source_type", sourceType, "queued_id", queuedID, "queue_auth_id", queueAuthID, "has_hash", strings.TrimSpace(remoteHash) != "")
+func (c *HTTPClient) FindQueuedTask(ctx context.Context, sourceType string, queuedID, queueAuthID, remoteHash string) (*TaskStatus, error) {
+	sourceType = normalizeSourceType(sourceType)
+	if sourceType == "" {
+		return nil, fmt.Errorf("source type is required")
+	}
 	if strings.TrimSpace(queuedID) == "" && strings.TrimSpace(queueAuthID) == "" && strings.TrimSpace(remoteHash) == "" {
-		return nil, fmt.Errorf("queued id, queue auth id, or remote hash is required")
+		return nil, fmt.Errorf("queued identity is required")
 	}
 	if err := c.wait(ctx, c.pollLimiter); err != nil {
 		return nil, err
 	}
 	items, err := c.getQueuedItems(ctx, sourceType, queuedID)
-	queueListFallback := false
-	lookupErr := err
+	initialErr := err
+	usedFullList := false
 	if err != nil {
-		if strings.TrimSpace(queuedID) == "" || isUsenetSource(sourceType) {
+		if strings.TrimSpace(queuedID) == "" {
 			return nil, err
 		}
-		// TorBox can reject an active-looking queue ID even while the queue
-		// list is available. Retry without the ID so the content hash can
-		// reconcile the two views.
+		if err := c.wait(ctx, c.pollLimiter); err != nil {
+			return nil, err
+		}
 		items, err = c.getQueuedItems(ctx, sourceType, "")
+		usedFullList = true
 		if err != nil {
 			return nil, err
 		}
-		queueListFallback = true
 	}
-	if status, matched := matchQueuedTask(sourceType, items, queuedID, queueAuthID, remoteHash); matched {
+	status, err := findTaskStatus(sourceType, items, "", queuedID, queueAuthID, remoteHash, true)
+	if err != nil {
+		return nil, err
+	}
+	if status != nil {
+		c.debug("matched queued torbox task",
+			"source_type", sourceType,
+			"queued_id", status.QueuedID,
+			"has_hash", status.Hash != "",
+		)
 		return status, nil
 	}
-	if !queueListFallback && !isUsenetSource(sourceType) && strings.TrimSpace(queuedID) != "" {
-		// An ID-filtered queue request can return an empty successful result
-		// while the item is still present in the unfiltered queue.
+	if !usedFullList && strings.TrimSpace(queuedID) != "" && !strings.EqualFold(sourceType, "usenet") {
+		if err := c.wait(ctx, c.pollLimiter); err != nil {
+			return nil, err
+		}
 		items, err = c.getQueuedItems(ctx, sourceType, "")
+		usedFullList = true
 		if err != nil {
 			return nil, err
 		}
-		if status, matched := matchQueuedTask(sourceType, items, queuedID, queueAuthID, remoteHash); matched {
+		status, err = findTaskStatus(sourceType, items, "", queuedID, queueAuthID, remoteHash, true)
+		if err != nil {
+			return nil, err
+		}
+		if status != nil {
 			return status, nil
 		}
 	}
-	if queueListFallback {
-		return nil, lookupErr
+	if initialErr != nil && !usedFullList {
+		return nil, initialErr
 	}
 	return nil, nil
 }
 
-func matchQueuedTask(sourceType string, items []map[string]any, queuedID, queueAuthID, remoteHash string) (*TaskStatus, bool) {
-	for _, item := range items {
-		itemID := extractQueuedID(item)
-		itemAuthID := extractQueueAuthID(sourceType, item)
-		itemHash := firstString(item, "hash")
-		if identifiersConflict(itemHash, remoteHash) {
-			continue
-		}
-		matchesID := strings.TrimSpace(queuedID) != "" && itemID == strings.TrimSpace(queuedID)
-		matchesAuthID := isUsenetSource(sourceType) && strings.TrimSpace(queueAuthID) != "" && itemAuthID == strings.TrimSpace(queueAuthID)
-		matchesHash := strings.TrimSpace(remoteHash) != "" && strings.EqualFold(itemHash, strings.TrimSpace(remoteHash))
-		if !matchesID && !matchesAuthID && !matchesHash {
-			continue
-		}
-		status := parseTaskStatus(sourceType, item, false)
-		status.QueuedID = itemID
-		status.QueueAuthID = itemAuthID
-		return status, true
-	}
-	return nil, false
+func (c *HTTPClient) FindActiveTask(ctx context.Context, sourceType string, remoteID, queueAuthID, remoteHash string) (*TaskStatus, error) {
+	return c.FindActiveTaskByIdentity(ctx, sourceType, remoteID, "", queueAuthID, remoteHash)
 }
 
-func (c *HTTPClient) FindActiveTask(ctx context.Context, sourceType string, remoteID, queueAuthID, remoteHash string) (*TaskStatus, error) {
+func (c *HTTPClient) FindActiveTaskByIdentity(ctx context.Context, sourceType string, remoteID, queuedID, queueAuthID, remoteHash string) (*TaskStatus, error) {
+	sourceType = normalizeSourceType(sourceType)
 	c.debug("finding active torbox task",
 		"source_type", sourceType,
 		"remote_id", remoteID,
-		"queue_auth_id", queueAuthID,
 		"has_hash", strings.TrimSpace(remoteHash) != "",
 	)
 	if err := c.wait(ctx, c.pollLimiter); err != nil {
 		return nil, err
 	}
 	items, err := c.getRemoteItems(ctx, sourceType, remoteID)
-	activeListFallback := false
-	lookupErr := err
+	initialErr := err
+	usedFullList := false
 	if err != nil {
-		if strings.TrimSpace(remoteID) == "" {
+		if strings.TrimSpace(remoteID) == "" || (strings.TrimSpace(queuedID) == "" && strings.TrimSpace(queueAuthID) == "" && strings.TrimSpace(remoteHash) == "") {
 			return nil, err
 		}
-		// A stale queue ID can make the ID-filtered active endpoint fail. A
-		// full active list can confirm the ID directly or use the other
-		// available identities.
+		if err := c.wait(ctx, c.pollLimiter); err != nil {
+			return nil, err
+		}
 		items, err = c.getRemoteItems(ctx, sourceType, "")
+		usedFullList = true
 		if err != nil {
 			return nil, err
 		}
-		activeListFallback = true
 	}
-	status, matched := matchActiveTask(sourceType, items, remoteID, queueAuthID, remoteHash)
-	if matched {
+	status, err := findTaskStatus(sourceType, items, remoteID, queuedID, queueAuthID, remoteHash, false)
+	if err != nil {
+		return nil, err
+	}
+	if status != nil {
+		c.debug("matched active torbox task",
+			"source_type", sourceType,
+			"remote_id", status.RemoteID,
+			"state", status.State,
+			"label", status.Label,
+			"download_ready", status.DownloadReady,
+			"files", len(status.Files),
+		)
 		return status, nil
 	}
-	if !activeListFallback && strings.TrimSpace(remoteID) != "" && (strings.TrimSpace(remoteHash) != "" || strings.TrimSpace(queueAuthID) != "") {
-		// The ID-filtered endpoint may return an empty successful response for
-		// a queue ID rather than an HTTP error. Reconcile by hash as well.
+	// An old active ID can disappear while the same task remains discoverable
+	// by its queue-auth ID, queue ID, or exact hash. Retry the lookup without the
+	// stale ID before declaring the active representation absent.
+	if !usedFullList && strings.TrimSpace(remoteID) != "" && (strings.TrimSpace(queuedID) != "" || strings.TrimSpace(queueAuthID) != "" || strings.TrimSpace(remoteHash) != "") {
+		if err := c.wait(ctx, c.pollLimiter); err != nil {
+			return nil, err
+		}
 		items, err = c.getRemoteItems(ctx, sourceType, "")
+		usedFullList = true
 		if err != nil {
 			return nil, err
 		}
-		status, matched = matchActiveTask(sourceType, items, "", queueAuthID, remoteHash)
-		if matched {
+		status, err = findTaskStatus(sourceType, items, remoteID, queuedID, queueAuthID, remoteHash, false)
+		if err != nil {
+			return nil, err
+		}
+		if status != nil {
 			return status, nil
 		}
 	}
-	if activeListFallback {
-		return nil, lookupErr
+	if initialErr != nil && !usedFullList {
+		return nil, initialErr
+	}
+	return nil, nil
+}
+
+func findTaskStatus(sourceType string, items []map[string]any, remoteID, queuedID, queueAuthID, remoteHash string, queued bool) (*TaskStatus, error) {
+	var conflict bool
+	for _, item := range items {
+		if taskIdentityConflict(sourceType, item, remoteID, queuedID, queueAuthID, remoteHash, queued) {
+			conflict = true
+			continue
+		}
+		if !matchesTaskIdentity(sourceType, item, remoteID, queuedID, queueAuthID, remoteHash, queued) {
+			continue
+		}
+		status := parseTaskStatus(sourceType, item, !queued)
+		if queued && status.QueuedID == "" {
+			status.QueuedID = extractQueuedID(item)
+		}
+		return status, nil
+	}
+	if conflict {
+		return nil, &ErrTorboxIdentityConflict{Err: fmt.Errorf("upstream %s task identity conflicts with stored content hash", map[bool]string{true: "queued", false: "active"}[queued])}
 	}
 	return nil, nil
 }
@@ -262,40 +301,8 @@ func (c *HTTPClient) ForceStartQueuedTask(ctx context.Context, sourceType, queue
 	return nil
 }
 
-func matchActiveTask(sourceType string, items []map[string]any, remoteID, queueAuthID, remoteHash string) (*TaskStatus, bool) {
-	for _, item := range items {
-		itemID := extractActiveID(sourceType, item, true)
-		itemHash := firstString(item, "hash")
-		itemAuthID := extractQueueAuthID(sourceType, item)
-		if identifiersConflict(itemHash, remoteHash) {
-			continue
-		}
-
-		switch {
-		case strings.TrimSpace(remoteID) != "" && itemID == strings.TrimSpace(remoteID):
-		case isUsenetSource(sourceType) && strings.TrimSpace(queueAuthID) != "" && itemAuthID == strings.TrimSpace(queueAuthID):
-		case strings.TrimSpace(remoteHash) != "" && strings.EqualFold(itemHash, strings.TrimSpace(remoteHash)):
-		default:
-			continue
-		}
-
-		status := parseTaskStatus(sourceType, item, true)
-		return status, true
-	}
-	return nil, false
-}
-
-func identifiersConflict(candidateHash, expectedHash string) bool {
-	candidateHash = strings.TrimSpace(candidateHash)
-	expectedHash = strings.TrimSpace(expectedHash)
-	return candidateHash != "" && expectedHash != "" && !strings.EqualFold(candidateHash, expectedHash)
-}
-
-func isUsenetSource(sourceType string) bool {
-	return strings.EqualFold(sourceType, "usenet") || strings.EqualFold(sourceType, "nzb")
-}
-
 func (c *HTTPClient) getRemoteItems(ctx context.Context, sourceType string, remoteID string) ([]map[string]any, error) {
+	sourceType = normalizeSourceType(sourceType)
 	endpoint := ""
 	query := url.Values{}
 	query.Set("bypass_cache", "true")
@@ -319,14 +326,11 @@ func (c *HTTPClient) getRemoteItems(ctx context.Context, sourceType string, remo
 }
 
 func (c *HTTPClient) getQueuedItems(ctx context.Context, sourceType string, queuedID string) ([]map[string]any, error) {
+	sourceType = normalizeSourceType(sourceType)
 	query := url.Values{}
-	queueType := strings.ToLower(sourceType)
-	if queueType == "nzb" {
-		queueType = "usenet"
-	}
-	query.Set("type", queueType)
+	query.Set("type", strings.ToLower(sourceType))
 	query.Set("bypass_cache", "true")
-	if !isUsenetSource(sourceType) && strings.TrimSpace(queuedID) != "" {
+	if !strings.EqualFold(sourceType, "usenet") && strings.TrimSpace(queuedID) != "" {
 		query.Set("id", strings.TrimSpace(queuedID))
 	}
 
@@ -339,11 +343,17 @@ func (c *HTTPClient) getQueuedItems(ctx context.Context, sourceType string, queu
 
 func (c *HTTPClient) DeleteTask(ctx context.Context, sourceType string, remoteID string) error {
 	id, err := strconv.ParseInt(strings.TrimSpace(remoteID), 10, 64)
-	if err != nil {
+	if err != nil || id < 0 {
+		if err == nil {
+			err = fmt.Errorf("id must not be negative")
+		}
 		return fmt.Errorf("upstream delete: remote id %q is not a numeric TorBox task id: %w", remoteID, err)
 	}
 	switch strings.ToLower(sourceType) {
 	case "torrent":
+		if err := c.wait(ctx, c.pollLimiter); err != nil {
+			return err
+		}
 		body := fmt.Sprintf(`{"operation":"delete","torrent_id":%d}`, id)
 		_, err := c.do(ctx, http.MethodPost, "/api/torrents/controltorrent", strings.NewReader(body), "application/json", true)
 		if err != nil {
@@ -351,6 +361,9 @@ func (c *HTTPClient) DeleteTask(ctx context.Context, sourceType string, remoteID
 		}
 		return nil
 	case "nzb", "usenet":
+		if err := c.wait(ctx, c.pollLimiter); err != nil {
+			return err
+		}
 		body := fmt.Sprintf(`{"operation":"delete","usenet_id":%d}`, id)
 		_, err := c.do(ctx, http.MethodPost, "/api/usenet/controlusenetdownload", strings.NewReader(body), "application/json", true)
 		if err != nil {
@@ -360,6 +373,90 @@ func (c *HTTPClient) DeleteTask(ctx context.Context, sourceType string, remoteID
 	default:
 		return fmt.Errorf("unknown source type for upstream delete: %q", sourceType)
 	}
+}
+
+func (c *HTTPClient) DeleteQueuedTask(ctx context.Context, sourceType string, queuedID string) error {
+	id, err := strconv.ParseInt(strings.TrimSpace(queuedID), 10, 64)
+	if err != nil || id < 0 {
+		if err == nil {
+			err = fmt.Errorf("id must not be negative")
+		}
+		return fmt.Errorf("upstream queued delete: queued id %q is not a numeric TorBox queue id: %w", queuedID, err)
+	}
+	body := fmt.Sprintf(`{"operation":"delete","queued_id":%d}`, id)
+	if err := c.wait(ctx, c.pollLimiter); err != nil {
+		return err
+	}
+	if _, err := c.do(ctx, http.MethodPost, "/api/queued/controlqueued", strings.NewReader(body), "application/json", true); err != nil {
+		return fmt.Errorf("delete queued task: %w", err)
+	}
+	return nil
+}
+
+func normalizeSourceType(sourceType string) string {
+	switch strings.ToLower(strings.TrimSpace(sourceType)) {
+	case "nzb", "usenet":
+		return "usenet"
+	case "torrent":
+		return "torrent"
+	default:
+		return ""
+	}
+}
+
+func isUsenetSource(sourceType string) bool {
+	return normalizeSourceType(sourceType) == "usenet"
+}
+
+func matchesTaskIdentity(sourceType string, item map[string]any, remoteID, queuedID, queueAuthID, remoteHash string, queued bool) bool {
+	remoteID = strings.TrimSpace(remoteID)
+	queuedID = strings.TrimSpace(queuedID)
+	queueAuthID = strings.TrimSpace(queueAuthID)
+	remoteHash = strings.TrimSpace(remoteHash)
+	itemHash := strings.TrimSpace(firstString(item, "hash"))
+	if remoteHash != "" && itemHash != "" && !strings.EqualFold(remoteHash, itemHash) {
+		return false
+	}
+	itemID := extractActiveID(sourceType, item, true)
+	if queued {
+		itemID = extractQueuedID(item)
+		if queuedID != "" && itemID == queuedID {
+			return true
+		}
+	} else if remoteID != "" && itemID == remoteID {
+		return true
+	}
+	if !queued && queuedID != "" && extractQueueReferenceID(item) == queuedID {
+		return true
+	}
+	if strings.EqualFold(sourceType, "usenet") && queueAuthID != "" && extractQueueAuthID(sourceType, item) == queueAuthID {
+		return true
+	}
+	return remoteHash != "" && itemHash != "" && strings.EqualFold(remoteHash, itemHash)
+}
+
+func taskIdentityConflict(sourceType string, item map[string]any, remoteID, queuedID, queueAuthID, remoteHash string, queued bool) bool {
+	remoteHash = strings.TrimSpace(remoteHash)
+	itemHash := strings.TrimSpace(firstString(item, "hash"))
+	if remoteHash == "" || itemHash == "" || strings.EqualFold(remoteHash, itemHash) {
+		return false
+	}
+	remoteID = strings.TrimSpace(remoteID)
+	queuedID = strings.TrimSpace(queuedID)
+	queueAuthID = strings.TrimSpace(queueAuthID)
+	if queued {
+		if queuedID != "" && extractQueuedID(item) == queuedID {
+			return true
+		}
+	} else {
+		if remoteID != "" && extractActiveID(sourceType, item, true) == remoteID {
+			return true
+		}
+		if queuedID != "" && extractQueueReferenceID(item) == queuedID {
+			return true
+		}
+	}
+	return strings.EqualFold(sourceType, "usenet") && queueAuthID != "" && extractQueueAuthID(sourceType, item) == queueAuthID
 }
 
 func attachFile(writer *multipart.Writer, field, path string) error {
