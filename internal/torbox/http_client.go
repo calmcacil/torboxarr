@@ -91,7 +91,7 @@ func (c *HTTPClient) do(ctx context.Context, method, path string, body io.Reader
 		// failure, but it is still subject to retry/escalation caps.
 		var env apiEnvelope
 		if resp.StatusCode >= 500 && len(bytes.TrimSpace(raw)) > 0 && json.Unmarshal(raw, &env) == nil && !env.Success {
-			return nil, &ErrTorboxLogical{Err: fmt.Errorf("torbox status %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))}
+			return nil, classifyEnvelopeError(&env, resp.StatusCode)
 		}
 		return nil, MarkRetryable(&HTTPStatusError{
 			StatusCode: resp.StatusCode,
@@ -113,13 +113,27 @@ func (c *HTTPClient) do(ctx context.Context, method, path string, body io.Reader
 		return nil, MarkRetryable(fmt.Errorf("decode response envelope: %w", err))
 	}
 	if !env.Success {
-		message := "torbox api returned success=false"
-		if env.Error != nil || env.Detail != "" {
-			message = fmt.Sprintf("torbox api error: %v (%s)", env.Error, env.Detail)
-		}
-		return nil, &ErrTorboxLogical{Err: errors.New(message)}
+		return nil, classifyEnvelopeError(&env, resp.StatusCode)
 	}
 	return &env, nil
+}
+
+func classifyEnvelopeError(env *apiEnvelope, status int) error {
+	code := strings.ToUpper(strings.TrimSpace(stringify(env.Error)))
+	message := "torbox api returned success=false"
+	if code != "" || env.Detail != "" {
+		message = fmt.Sprintf("torbox api error: %s (%s)", code, env.Detail)
+	}
+	switch code {
+	case "ITEM_NOT_FOUND":
+		return &ErrTorboxAbsent{Err: errors.New(message)}
+	case "BAD_TOKEN":
+		return &HTTPStatusError{StatusCode: http.StatusUnauthorized, Message: message}
+	case "INVALID_OPTION", "MISSING_REQUIRED_OPTION":
+		return &HTTPStatusError{StatusCode: http.StatusBadRequest, Message: message}
+	default:
+		return &ErrTorboxLogical{Err: fmt.Errorf("torbox status %d: %s", status, message)}
+	}
 }
 
 func (c *HTTPClient) wait(ctx context.Context, limiter Waiter) error {

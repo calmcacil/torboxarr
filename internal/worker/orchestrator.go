@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -22,6 +23,7 @@ type Orchestrator struct {
 	layout     *files.Layout
 	downloader *files.RangeDownloader
 	torbox     torbox.Client
+	claimToken string
 	wg         sync.WaitGroup
 }
 
@@ -33,6 +35,7 @@ func NewOrchestrator(cfg *config.Config, log *slog.Logger, st *store.Store, layo
 		layout:     layout,
 		downloader: downloader,
 		torbox:     client,
+		claimToken: strconv.Itoa(os.Getpid()) + "-" + strconv.FormatInt(time.Now().UnixNano(), 36),
 	}
 }
 
@@ -94,8 +97,11 @@ func (o *Orchestrator) runLoop(ctx context.Context, name string, every time.Dura
 }
 
 func (o *Orchestrator) reconcileStartup(ctx context.Context) error {
-	// Release all stale claims from a previous run (crash recovery)
-	if err := o.store.ReleaseAllClaims(ctx); err != nil {
+	lease := o.cfg.TorBox.RequestTimeout * time.Duration(max(o.cfg.Workers.BatchSize, 1)*8)
+	if lease < 5*time.Minute {
+		lease = 5 * time.Minute
+	}
+	if err := o.store.RecoverClaims(ctx, time.Now().UTC().Add(-lease)); err != nil {
 		return fmt.Errorf("release stale claims: %w", err)
 	}
 

@@ -13,7 +13,8 @@ import (
 )
 
 func (o *Orchestrator) runRemover(ctx context.Context) error {
-	jobs, err := o.store.ClaimJobsDue(ctx, "remover", []store.JobState{store.StateRemovePending}, time.Now().UTC(), o.cfg.Workers.BatchSize)
+	owner := "remover-" + o.claimToken
+	jobs, err := o.store.ClaimJobsDue(ctx, owner, []store.JobState{store.StateRemovePending}, time.Now().UTC(), o.cfg.Workers.BatchSize)
 	if err != nil {
 		return err
 	}
@@ -24,12 +25,15 @@ func (o *Orchestrator) runRemover(ctx context.Context) error {
 		if err := o.processRemoveJob(ctx, job); err != nil {
 			o.log.Error("remove job failed", "job_id", job.ID, "error", err)
 		}
-		o.releaseJobClaim(ctx, "remover", job.ID)
+		if err := o.store.ReleaseJobClaimOwned(ctx, job.ID, owner); err != nil {
+			o.log.Error("failed to release job claim", "worker", "remover", "job_id", job.ID, "error", err)
+		}
 	}
 	return nil
 }
 
 const maxUpstreamDeleteAttempts = 5
+const maxUpstreamReconciliationFailures = 5
 
 type removalView struct {
 	name           string
@@ -71,6 +75,14 @@ func (o *Orchestrator) processRemoveJob(ctx context.Context, job *store.Job) err
 	// in the same pre-delete reconciliation phase.
 	_, queued = o.removalViews(job)
 	queuedLookupRetry := o.reconcileRemovalView(ctx, job, &queued)
+	if queued.status != nil && strings.TrimSpace(queued.status.RemoteID) != "" && (activeLookupRetry || job.Metadata.ActiveRemoval.Outcome == store.UpstreamRemovalAbsent) {
+		job.RemoteID = ptr(strings.TrimSpace(queued.status.RemoteID))
+		if job.Metadata.ActiveRemoval.Outcome == store.UpstreamRemovalAbsent {
+			job.Metadata.ActiveRemoval = store.UpstreamRemovalProgress{}
+		}
+		active, _ = o.removalViews(job)
+		activeLookupRetry = o.reconcileRemovalView(ctx, job, &active)
+	}
 	if !active.applicable && !queued.applicable {
 		setRemovalOutcome(&job.Metadata.ActiveRemoval, store.UpstreamRemovalUnidentifiable, "no safe upstream identity")
 	}
@@ -133,6 +145,9 @@ func (o *Orchestrator) removalViews(job *store.Job) (removalView, removalView) {
 			if status.QueuedID != "" {
 				job.QueuedID = ptr(status.QueuedID)
 			}
+			if status.RemoteID != "" {
+				job.RemoteID = ptr(status.RemoteID)
+			}
 			if status.Hash != "" {
 				job.RemoteHash = ptr(status.Hash)
 			}
@@ -189,7 +204,14 @@ func (o *Orchestrator) reconcileRemovalView(ctx context.Context, job *store.Job,
 				"job_id", job.ID, "public_id", job.PublicID, "source_type", job.SourceType, "upstream_view", view.name)
 			return false
 		}
+		view.progress.ReconciliationFailures++
 		view.progress.LastError = "TorBox lookup failed"
+		if view.progress.ReconciliationFailures >= maxUpstreamReconciliationFailures {
+			setRemovalOutcome(view.progress, store.UpstreamRemovalExhausted, "TorBox reconciliation failure budget exhausted")
+			o.log.Warn("upstream reconciliation exhausted its failure budget; proceeding with local cleanup",
+				"job_id", job.ID, "public_id", job.PublicID, "source_type", job.SourceType, "upstream_view", view.name, "failures", view.progress.ReconciliationFailures)
+			return false
+		}
 		o.log.Warn("upstream cleanup reconciliation failed; will retry",
 			"job_id", job.ID,
 			"public_id", job.PublicID,
@@ -261,7 +283,14 @@ func (o *Orchestrator) deleteRemovalView(ctx context.Context, job *store.Job, vi
 		o.log.Info("upstream deletion found representation already absent", "job_id", job.ID, "public_id", job.PublicID, "source_type", job.SourceType, "upstream_view", view.name, "control_id", controlID)
 		return false
 	case torbox.IsRequestNotSent(err):
+		view.progress.ReconciliationFailures++
 		view.progress.LastError = "TorBox delete request was not sent"
+		if view.progress.ReconciliationFailures >= maxUpstreamReconciliationFailures {
+			setRemovalOutcome(view.progress, store.UpstreamRemovalExhausted, "TorBox pre-send failure budget exhausted")
+			o.log.Warn("upstream deletion exhausted its pre-send failure budget; proceeding with local cleanup",
+				"job_id", job.ID, "public_id", job.PublicID, "source_type", job.SourceType, "upstream_view", view.name, "failures", view.progress.ReconciliationFailures)
+			return false
+		}
 		o.log.Warn("upstream deletion was not sent; will retry without consuming an attempt",
 			"job_id", job.ID, "public_id", job.PublicID, "source_type", job.SourceType, "upstream_view", view.name, "control_id", controlID)
 		return true

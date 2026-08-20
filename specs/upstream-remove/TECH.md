@@ -45,10 +45,11 @@ metadata in `store.SubmissionMetadata`:
 
 ```go
 type UpstreamRemovalProgress struct {
-    Attempts    int        `json:"attempts,omitempty"`
-    CompletedAt *time.Time `json:"completed_at,omitempty"`
-    Outcome     string     `json:"outcome,omitempty"`
-    LastError   string     `json:"last_error,omitempty"`
+    Attempts               int        `json:"attempts,omitempty"`
+    ReconciliationFailures int        `json:"reconciliation_failures,omitempty"`
+    CompletedAt            *time.Time `json:"completed_at,omitempty"`
+    Outcome                string     `json:"outcome,omitempty"`
+    LastError              string     `json:"last_error,omitempty"`
 }
 
 ActiveRemoval UpstreamRemovalProgress `json:"active_removal,omitempty"`
@@ -94,6 +95,12 @@ For each unfinished view:
 
 Hash conflicts reject candidates even when IDs match. Display names are not
 used. Torrent and Usenet identities are never matched across source types.
+
+Lookup failures and failures known to occur before a delete request is sent
+increment `ReconciliationFailures`, not `Attempts`. Five such
+failures record `exhausted` and permit local cleanup with a warning. A
+successful reconciliation resets no persisted delete progress and establishes
+the current control target.
 
 Reconcile before the first delete and again after every uncertain delete
 result. A deterministic non-retryable delete rejection does not require another
@@ -175,7 +182,10 @@ if an operator later corrects the local problem and retries removal.
 ### Concurrency And Crashes
 
 `ClaimJobsDue` prevents ordinary concurrent remover workers from processing the
-same job. Persist per-view completion before releasing the claim.
+same job. Remover claims use a unique process owner, are released only by that
+owner, and startup reclaims them only after a conservative lease derived from
+the TorBox request timeout and maximum batch duration. Persist per-view
+completion before releasing the claim.
 
 The external request and SQLite update cannot be atomic. If the process crashes
 after TorBox accepts deletion, the next run reconciles the view. Confirmed

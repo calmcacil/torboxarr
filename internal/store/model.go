@@ -46,10 +46,11 @@ func (s JobState) Closed() bool {
 // UpstreamRemovalProgress records independently persisted cleanup progress for
 // one TorBox representation of a job. A terminal outcome is never retried.
 type UpstreamRemovalProgress struct {
-	Attempts    int        `json:"attempts,omitempty"`
-	CompletedAt *time.Time `json:"completed_at,omitempty"`
-	Outcome     string     `json:"outcome,omitempty"`
-	LastError   string     `json:"last_error,omitempty"`
+	Attempts               int        `json:"attempts,omitempty"`
+	ReconciliationFailures int        `json:"reconciliation_failures,omitempty"`
+	CompletedAt            *time.Time `json:"completed_at,omitempty"`
+	Outcome                string     `json:"outcome,omitempty"`
+	LastError              string     `json:"last_error,omitempty"`
 }
 
 const (

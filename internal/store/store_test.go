@@ -265,6 +265,34 @@ func TestMarkJobRemovePendingPreservesWorkerData(t *testing.T) {
 	}
 }
 
+func TestUpdateJobRemovalProgressDoesNotRegress(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	job := makeJob("progress-monotonic-001", "pub-progress-monotonic-001", store.StateRemovePending)
+	job.DeleteRequested = true
+	job.Metadata.ActiveRemoval.Attempts = 3
+	job.Metadata.QueuedRemoval.Outcome = store.UpstreamRemovalDeleted
+	completed := time.Now().UTC()
+	job.Metadata.QueuedRemoval.CompletedAt = &completed
+	if err := st.CreateJob(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+
+	stale := *job
+	stale.Metadata.ActiveRemoval.Attempts = 1
+	stale.Metadata.QueuedRemoval = store.UpstreamRemovalProgress{}
+	if err := st.UpdateJob(ctx, &stale); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.GetJobByID(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Metadata.ActiveRemoval.Attempts != 3 || got.Metadata.QueuedRemoval.Outcome != store.UpstreamRemovalDeleted {
+		t.Fatalf("removal progress regressed: active=%#v queued=%#v", got.Metadata.ActiveRemoval, got.Metadata.QueuedRemoval)
+	}
+}
+
 // ─── FindActiveBySubmissionKey ───────────────────────────────────────────────
 
 func TestFindActiveBySubmissionKey(t *testing.T) {
@@ -815,6 +843,72 @@ func TestReleaseJobClaim(t *testing.T) {
 	}
 	if len(claimed2) != 1 {
 		t.Errorf("expected 1 claimable job after release, got %d", len(claimed2))
+	}
+}
+
+func TestReleaseJobClaimOwnedRequiresOwner(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	job := makeJob("owned-claim-001", "pub-owned-claim-001", store.StateRemovePending)
+	if err := st.CreateJob(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ClaimJobsDue(ctx, "remover-owner", []store.JobState{store.StateRemovePending}, time.Now().UTC(), 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.ReleaseJobClaimOwned(ctx, job.ID, "other-owner"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.GetJobByID(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ClaimedBy == nil || *got.ClaimedBy != "remover-owner" {
+		t.Fatalf("claim = %v, want remover-owner", got.ClaimedBy)
+	}
+	if err := st.ReleaseJobClaimOwned(ctx, job.ID, "remover-owner"); err != nil {
+		t.Fatal(err)
+	}
+	got, err = st.GetJobByID(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ClaimedBy != nil {
+		t.Fatalf("claim = %v, want released", got.ClaimedBy)
+	}
+}
+
+func TestRecoverClaimsPreservesLiveRemoverClaim(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	live := makeJob("live-remover-001", "pub-live-remover-001", store.StateRemovePending)
+	ordinary := makeJob("ordinary-claim-001", "pub-ordinary-claim-001", store.StateSubmitPending)
+	if err := st.CreateJob(ctx, live); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateJob(ctx, ordinary); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ClaimJobsDue(ctx, "remover-live", []store.JobState{store.StateRemovePending}, now, 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ClaimJobsDue(ctx, "submitter", []store.JobState{store.StateSubmitPending}, now, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RecoverClaims(ctx, now.Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	live, err := st.GetJobByID(ctx, live.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ordinary, err = st.GetJobByID(ctx, ordinary.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if live.ClaimedBy == nil || ordinary.ClaimedBy != nil {
+		t.Fatalf("claims = live:%v ordinary:%v, want live preserved and ordinary released", live.ClaimedBy, ordinary.ClaimedBy)
 	}
 }
 
