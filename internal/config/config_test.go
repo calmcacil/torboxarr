@@ -3,7 +3,9 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestValidateRejectsPlaceholderSecrets(t *testing.T) {
@@ -28,7 +30,9 @@ func TestApplyEnvUsesMinimalSurface(t *testing.T) {
 	t.Setenv("TORBOXARR_QBIT_PASSWORD", "resolved-password")
 	t.Setenv("TORBOXARR_SAB_API_KEY", "resolved-sab-api-key")
 
-	applyEnv(&cfg)
+	if err := applyEnv(&cfg); err != nil {
+		t.Fatal(err)
+	}
 	cfg.applyDerived()
 
 	if cfg.Server.BaseURL != "https://torboxarr.example.com" {
@@ -62,7 +66,9 @@ func TestApplyEnvAllowsExplicitSABNZBKey(t *testing.T) {
 	t.Setenv("TORBOXARR_SAB_API_KEY", "resolved-sab-api-key")
 	t.Setenv("TORBOXARR_SAB_NZB_KEY", "resolved-sab-nzb-key")
 
-	applyEnv(&cfg)
+	if err := applyEnv(&cfg); err != nil {
+		t.Fatal(err)
+	}
 	cfg.applyDerived()
 
 	if cfg.Auth.SABNZBKey != "resolved-sab-nzb-key" {
@@ -92,7 +98,9 @@ func TestApplyEnvAllowsExplicitDatabasePath(t *testing.T) {
 
 	t.Setenv("TORBOXARR_DATABASE_PATH", wantDBPath)
 
-	applyEnv(&cfg)
+	if err := applyEnv(&cfg); err != nil {
+		t.Fatal(err)
+	}
 	cfg.applyDerived()
 
 	if cfg.Database.Path != wantDBPath {
@@ -105,6 +113,55 @@ func TestDefaultConfigKeepsTorBoxCreateHourlyLimit(t *testing.T) {
 
 	if cfg.TorBox.CreatePerHour != 60 {
 		t.Fatalf("TorBox.CreatePerHour = %d, want 60", cfg.TorBox.CreatePerHour)
+	}
+}
+
+func TestDefaultConfigDisablesQueuedForceStart(t *testing.T) {
+	cfg := defaultConfig()
+
+	if cfg.Workers.QueuedForceStartAfter != 0 {
+		t.Fatalf("QueuedForceStartAfter = %s, want disabled", cfg.Workers.QueuedForceStartAfter)
+	}
+}
+
+func TestApplyEnvReadsRemoteAbsenceAttempts(t *testing.T) {
+	cfg := defaultConfig()
+	t.Setenv("TORBOXARR_REMOTE_ABSENCE_ATTEMPTS", "9")
+
+	if err := applyEnv(&cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Workers.RemoteAbsenceAttempts != 9 {
+		t.Fatalf("RemoteAbsenceAttempts = %d, want 9", cfg.Workers.RemoteAbsenceAttempts)
+	}
+}
+
+func TestApplyEnvReadsQueuedForceStartDuration(t *testing.T) {
+	cfg := defaultConfig()
+	t.Setenv("TORBOXARR_QUEUED_FORCE_START_AFTER", "90m")
+	if err := applyEnv(&cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Workers.QueuedForceStartAfter != 90*time.Minute {
+		t.Fatalf("QueuedForceStartAfter = %s, want 90m", cfg.Workers.QueuedForceStartAfter)
+	}
+}
+
+func TestApplyEnvRejectsInvalidQueuedForceStartDuration(t *testing.T) {
+	cfg := defaultConfig()
+	t.Setenv("TORBOXARR_QUEUED_FORCE_START_AFTER", "not-a-duration")
+	err := applyEnv(&cfg)
+	if err == nil || !strings.Contains(err.Error(), "TORBOXARR_QUEUED_FORCE_START_AFTER") {
+		t.Fatalf("applyEnv() = %v, want named duration error", err)
+	}
+}
+
+func TestValidateRejectsNegativeQueuedForceStartDuration(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.Workers.QueuedForceStartAfter = -time.Second
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "TORBOXARR_QUEUED_FORCE_START_AFTER") {
+		t.Fatal("expected negative force-start duration validation error")
 	}
 }
 

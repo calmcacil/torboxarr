@@ -119,6 +119,39 @@ func TestUpdateJob(t *testing.T) {
 	}
 }
 
+func TestJobMetadataRoundTripsForceStartLifecycle(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	queuedAt := time.Date(2026, 8, 19, 12, 0, 0, 123456789, time.UTC)
+	attemptedAt := queuedAt.Add(3 * time.Hour)
+	acceptedAt := attemptedAt.Add(time.Second)
+	job := makeJob("metadata-force-start", "pub-metadata-force-start", store.StateRemoteQueued)
+	job.Metadata.QueuedAt = &queuedAt
+	job.Metadata.ForceStartLastAttemptAt = &attemptedAt
+	job.Metadata.ForceStartAcceptedAt = &acceptedAt
+	job.Metadata.IgnoreQueueCreatedAt = true
+	if err := st.CreateJob(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := st.GetJobByID(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, pair := range map[string][2]*time.Time{
+		"queued":   {&queuedAt, got.Metadata.QueuedAt},
+		"attempt":  {&attemptedAt, got.Metadata.ForceStartLastAttemptAt},
+		"accepted": {&acceptedAt, got.Metadata.ForceStartAcceptedAt},
+	} {
+		if pair[1] == nil || !pair[1].Equal(*pair[0]) {
+			t.Errorf("%s timestamp = %v, want %v", name, pair[1], pair[0])
+		}
+	}
+	if !got.Metadata.IgnoreQueueCreatedAt {
+		t.Fatal("IgnoreQueueCreatedAt = false, want persisted true")
+	}
+}
+
 // ─── UpdateJobState ──────────────────────────────────────────────────────────
 
 func TestUpdateJobState(t *testing.T) {
@@ -140,6 +173,38 @@ func TestUpdateJobState(t *testing.T) {
 	}
 	if got.State != store.StateSubmitPending {
 		t.Errorf("State = %q, want %q", got.State, store.StateSubmitPending)
+	}
+}
+
+func TestUpdateJobStateIfCurrentRejectsConcurrentRemoval(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	job := makeJob("conditional-001", "pub-conditional-001", store.StateRemoteActive)
+	job.State = store.StateRemoteActive
+	if err := st.CreateJob(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+
+	job.DeleteRequested = true
+	if err := st.UpdateJobState(ctx, job, store.StateRemovePending, "remove requested"); err != nil {
+		t.Fatal(err)
+	}
+
+	job.State = store.StateRemoteActive
+	job.NextRunAt = timePtr(time.Now().UTC())
+	ok, err := st.UpdateJobStateIfCurrent(ctx, job, store.StateRemoteActive, store.StateRemoteQueued, "stale recovery")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatal("stale poll update should not be applied after removal")
+	}
+	got, err := st.GetJobByID(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != store.StateRemovePending {
+		t.Fatalf("state = %s, want remove_pending", got.State)
 	}
 }
 

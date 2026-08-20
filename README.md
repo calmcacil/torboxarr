@@ -4,13 +4,6 @@ Pretends to be qBittorrent or SABnzbd so your *arr apps can use [TorBox](https:/
 
 When Sonarr or Radarr sends a torrent or NZB, TorBoxarr accepts it through the standard qBittorrent/SABnzbd API, submits it to TorBox, polls until the remote download finishes, pulls the files down locally, and places them where the *arr app expects to find them.
 
-## Support
-
-If TorBoxarr has been useful to you and you want to support the project, you can use my TorBox referral when you subscribe:
-
-- Referral code: `605c7a7b-6913-4ec3-868c-061aa6694f43`
-- Referral link: [torbox.app/subscription?referral=605c7a7b-6913-4ec3-868c-061aa6694f43](https://torbox.app/subscription?referral=605c7a7b-6913-4ec3-868c-061aa6694f43)
-
 ## How it works
 
 TorBoxarr runs a single Go binary with an HTTP server and a set of background workers. The server handles two API surfaces:
@@ -68,7 +61,19 @@ Optional overrides:
 | `TORBOXARR_DATA_ROOT` | `/data` | Root directory for staging, completed files, and payloads |
 | `TORBOXARR_DATABASE_PATH` | `/config/torboxarr.db` | SQLite database path; the container stores state under `/config` |
 | `TORBOXARR_LOG_LEVEL` | `INFO` | Log verbosity: DEBUG, INFO, WARN, or ERROR |
+| `TORBOXARR_REMOTE_ABSENCE_ATTEMPTS` | `5` | Successful queue/active absence checks before a remote job is marked failed |
+| `TORBOXARR_QUEUED_FORCE_START_AFTER` | disabled | Opt-in automatic force-start for a confirmed queued job; set a positive duration such as `3h` to enable, or `0` to disable |
 | `TORBOXARR_SAB_NZB_KEY` | falls back to `TORBOXARR_SAB_API_KEY` | Explicit key for the SABnzbd-compatible endpoint; omit it to reuse the SAB API key |
+| `TORBOXARR_UPSTREAM_REMOVE` | `false` | When true, removing a download also deletes the matching task from TorBox's servers, so cached entries don't accumulate there |
+
+Automatic queued force-start is disabled unless `TORBOXARR_QUEUED_FORCE_START_AFTER`
+is set to a positive duration such as `3h`. The setting is evaluated against the
+current confirmed queue lifecycle and does not change a job's Arr-visible state.
+For database diagnostics, the job's `metadata_json` records `queued_at`,
+`force_start_last_attempt_at`, and `force_start_accepted_at`; a non-null accepted
+timestamp means TorBox accepted the control request for that queue lifecycle.
+It may also record `ignore_queue_created_at` when a fresh active-to-queued
+lifecycle cannot safely reuse TorBox's older queue creation timestamp.
 
 Docker-specific runtime variables used by the bundled compose file. Set these to the same UID/GID that Sonarr and Radarr use on the host, so TorBoxarr can write to the same download and category folders:
 
@@ -76,6 +81,12 @@ Docker-specific runtime variables used by the bundled compose file. Set these to
 |---|---|---|
 | `PUID` | none | UID the container drops to before starting TorBoxarr; required for the bundled Docker setup |
 | `PGID` | none | GID the container drops to before starting TorBoxarr; required for the bundled Docker setup |
+
+#### Removing downloads from TorBox
+
+By default TorBoxarr only deletes the local copy when a download is removed; the entry stays in your TorBox account. Set `TORBOXARR_UPSTREAM_REMOVE=true` to also delete the matching task from TorBox when a job is removed. This keeps your TorBox cache from filling up with entries that the *arr apps have already imported and discarded.
+
+The upstream delete happens as part of the local removal: if it fails (for example, a transient TorBox API error) TorBoxarr logs a warning and still cleans up the local files, so a stuck remote entry never blocks local cleanup. Check the logs for `upstream torbox task deleted` to confirm the remote entry was removed, or `torbox content retained` if it was skipped or failed.
 
 ### Connecting Sonarr/Radarr / Download Clients
 

@@ -1,0 +1,260 @@
+package worker
+
+import (
+	"context"
+	"errors"
+	"io"
+	"log/slog"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/mrjoiny/torboxarr/internal/config"
+	"github.com/mrjoiny/torboxarr/internal/files"
+	"github.com/mrjoiny/torboxarr/internal/store"
+	"github.com/mrjoiny/torboxarr/internal/torbox"
+)
+
+// pollTestEnv mirrors removeTestEnv but is used for poll-path tests.
+type pollTestEnv struct {
+	orch  *Orchestrator
+	store *store.Store
+	mock  *torbox.MockClient
+	dir   string
+}
+
+func newPollTestEnv(t *testing.T) *pollTestEnv {
+	t.Helper()
+	ctx := context.Background()
+
+	db, err := store.Open(ctx, ":memory:", 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.SetMaxOpenConns(1)
+	if err := store.RunMigrationsFS(db, store.EmbeddedMigrations); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	st := store.New(db)
+
+	dir := t.TempDir()
+	layout := files.NewLayout(dir, filepath.Join(dir, "staging"), filepath.Join(dir, "completed"), filepath.Join(dir, "payloads"))
+	if err := layout.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{}
+	cfg.Logging.Level = "ERROR"
+	cfg.Database.Path = ":memory:"
+	cfg.Data.Root = dir
+	cfg.Data.Staging = filepath.Join(dir, "staging")
+	cfg.Data.Completed = filepath.Join(dir, "completed")
+	cfg.Data.Payloads = filepath.Join(dir, "payloads")
+	cfg.TorBox.BaseURL = "https://api.torbox.app/v1"
+	cfg.TorBox.APIToken = "test-token"
+	cfg.Auth.QBitUsername = "admin"
+	cfg.Auth.QBitPassword = "password"
+	cfg.Auth.SABAPIKey = "sabapikey"
+	cfg.Auth.SABNZBKey = "sabnzbkey"
+	cfg.Workers.SubmitInterval = 5 * time.Second
+	cfg.Workers.PollInterval = 30 * time.Second
+	cfg.Workers.DownloadInterval = 5 * time.Second
+	cfg.Workers.FinalizeInterval = 3 * time.Second
+	cfg.Workers.RemoveInterval = 5 * time.Second
+	cfg.Workers.PruneInterval = 12 * time.Hour
+	cfg.Workers.SubmitRetryMin = 100 * time.Millisecond
+	cfg.Workers.SubmitRetryMax = 1 * time.Second
+	cfg.Workers.RemovedRetention = 30 * 24 * time.Hour
+	cfg.Workers.BatchSize = 25
+
+	mock := &torbox.MockClient{}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	downloader := files.NewRangeDownloader(logger, 30*time.Second)
+	orch := NewOrchestrator(cfg, logger, st, layout, downloader, mock)
+
+	return &pollTestEnv{orch: orch, store: st, mock: mock, dir: dir}
+}
+
+// TestProcessPollJob_LogicalErrorRemainsNonTerminal verifies that a structured
+// TorBox error is retried without treating the lookup failure as confirmed
+// absence. This is important for queue-only IDs, which can return DATABASE_ERROR
+// from the active endpoint while remaining present in TorBox's queue.
+func TestProcessPollJob_LogicalErrorRemainsNonTerminal(t *testing.T) {
+	env := newPollTestEnv(t)
+
+	var calls int
+	env.mock.GetTaskStatusFn = func(_ context.Context, _, _ string) (*torbox.TaskStatus, error) {
+		calls++
+		return nil, &torbox.ErrTorboxLogical{Err: errors.New("torbox status 500: success:false DATABASE_ERROR")}
+	}
+
+	job := &store.Job{
+		ID:         "ghost-001",
+		PublicID:   "pub-ghost-001",
+		SourceType: store.SourceTypeTorrent,
+		ClientKind: store.ClientKindQBit,
+		Category:   "movies",
+		State:      store.StateRemoteActive,
+		RemoteID:   ptr("59006036"),
+		CreatedAt:  time.Now().UTC(),
+		UpdatedAt:  time.Now().UTC(),
+	}
+	if err := env.store.CreateJob(context.Background(), job); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	for attempt := 1; attempt <= maxPollAttempts; attempt++ {
+		got, err := env.store.GetJobByID(ctx, "ghost-001")
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = env.orch.processPollJob(ctx, got)
+		if err != nil {
+			t.Fatalf("attempt %d: expected retry (no error), got %v", attempt, err)
+		}
+	}
+
+	if calls != maxPollAttempts {
+		t.Errorf("expected %d GetTaskStatus calls, got %d", maxPollAttempts, calls)
+	}
+
+	got, err := env.store.GetJobByID(ctx, "ghost-001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != store.StateRemoteActive {
+		t.Errorf("lookup errors must remain non-terminal; state=%s", got.State)
+	}
+	if got.Metadata.PollAttempts != 0 {
+		t.Errorf("lookup errors must not increment PollAttempts; got %d", got.Metadata.PollAttempts)
+	}
+	if got.NextRunAt == nil {
+		t.Error("lookup error should schedule another poll")
+	}
+}
+
+// TestProcessPollJob_TransientRetryableStillRetries confirms transport-level
+// retryable errors remain non-terminal and do not count as confirmed absence.
+func TestProcessPollJob_TransientRetryableStillRetries(t *testing.T) {
+	env := newPollTestEnv(t)
+
+	var calls int
+	env.mock.GetTaskStatusFn = func(_ context.Context, _, _ string) (*torbox.TaskStatus, error) {
+		calls++
+		return nil, torbox.MarkRetryable(errors.New("torbox status 503: transient"))
+	}
+
+	job := &store.Job{
+		ID:         "retry-001",
+		PublicID:   "pub-retry-001",
+		SourceType: store.SourceTypeTorrent,
+		ClientKind: store.ClientKindQBit,
+		Category:   "movies",
+		State:      store.StateRemoteActive,
+		RemoteID:   ptr("59006037"),
+		CreatedAt:  time.Now().UTC(),
+		UpdatedAt:  time.Now().UTC(),
+	}
+	if err := env.store.CreateJob(context.Background(), job); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	for attempt := 1; attempt <= maxPollAttempts; attempt++ {
+		got, err := env.store.GetJobByID(ctx, "retry-001")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = env.orch.processPollJob(ctx, got)
+	}
+
+	if calls != maxPollAttempts {
+		t.Errorf("expected %d GetTaskStatus calls, got %d", maxPollAttempts, calls)
+	}
+	got, err := env.store.GetJobByID(ctx, "retry-001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != store.StateRemoteActive {
+		t.Errorf("lookup errors must remain non-terminal; state=%s", got.State)
+	}
+	if got.Metadata.PollAttempts != 0 {
+		t.Errorf("lookup errors must not increment PollAttempts; got %d", got.Metadata.PollAttempts)
+	}
+	if got.NextRunAt == nil {
+		t.Error("lookup error should schedule another poll")
+	}
+}
+
+func TestProcessPollJob_ResetsPollAttemptsAfterSuccessfulStatus(t *testing.T) {
+	env := newPollTestEnv(t)
+
+	var calls int
+	env.mock.GetTaskStatusFn = func(_ context.Context, _, _ string) (*torbox.TaskStatus, error) {
+		calls++
+		if calls == 1 {
+			return &torbox.TaskStatus{
+				RemoteID: "remote-recovered-001",
+				State:    "downloading",
+			}, nil
+		}
+		return nil, torbox.MarkRetryable(errors.New("torbox status 503: transient"))
+	}
+
+	now := time.Now().UTC()
+	job := &store.Job{
+		ID:         "recovered-001",
+		PublicID:   "pub-recovered-001",
+		SourceType: store.SourceTypeTorrent,
+		ClientKind: store.ClientKindQBit,
+		Category:   "movies",
+		State:      store.StateRemoteActive,
+		RemoteID:   ptr("59006038"),
+		Metadata:   store.SubmissionMetadata{PollAttempts: maxPollAttempts - 1},
+		CreatedAt:  now,
+		UpdatedAt:  now,
+	}
+	if err := env.store.CreateJob(context.Background(), job); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	got, err := env.store.GetJobByID(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := env.orch.processPollJob(ctx, got); err != nil {
+		t.Fatalf("successful poll: %v", err)
+	}
+
+	got, err = env.store.GetJobByID(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Metadata.PollAttempts != 0 {
+		t.Fatalf("PollAttempts after successful poll = %d, want 0", got.Metadata.PollAttempts)
+	}
+
+	for attempt := 1; attempt < maxPollAttempts; attempt++ {
+		got, err = env.store.GetJobByID(ctx, job.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := env.orch.processPollJob(ctx, got); err != nil {
+			t.Fatalf("retryable poll %d: %v", attempt, err)
+		}
+	}
+
+	got, err = env.store.GetJobByID(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != store.StateRemoteActive {
+		t.Fatalf("state after four consecutive failures = %s, want %s", got.State, store.StateRemoteActive)
+	}
+	if got.Metadata.PollAttempts != 0 {
+		t.Errorf("PollAttempts after lookup failures = %d, want 0", got.Metadata.PollAttempts)
+	}
+}

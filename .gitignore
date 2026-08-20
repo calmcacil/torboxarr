@@ -19,6 +19,10 @@
 /.env.*
 !/.env.example
 
+# Local fork notes (gitignored, do not commit)
+/*.local.md
+/manual-push.md
+
 # IDE and OS files
 /.idea/
 /.vscode/

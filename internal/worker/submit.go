@@ -29,6 +29,7 @@ func (o *Orchestrator) runSubmitter(ctx context.Context) error {
 }
 
 func (o *Orchestrator) processSubmitJob(ctx context.Context, job *store.Job) error {
+	expectedState := job.State
 	o.log.Info("submitting job to torbox",
 		"job_id", job.ID,
 		"public_id", job.PublicID,
@@ -74,10 +75,20 @@ func (o *Orchestrator) processSubmitJob(ctx context.Context, job *store.Job) err
 		return o.handleSubmitFailure(ctx, job, torbox.MarkRetryable(fmt.Errorf("torbox create returned empty response")))
 	}
 
-	job.RemoteID = ptr(strings.TrimSpace(resp.RemoteID))
-	job.QueuedID = ptr(strings.TrimSpace(resp.QueuedID))
+	remoteID := strings.TrimSpace(resp.RemoteID)
+	queuedID := strings.TrimSpace(resp.QueuedID)
+	// A duplicated generic ID is queue tracking, not active confirmation.
+	if remoteID != "" && queuedID != "" && remoteID == queuedID && !resp.ActiveIDExplicit {
+		remoteID = ""
+	}
+	job.RemoteID = ptr(remoteID)
+	job.QueuedID = ptr(queuedID)
 	job.QueueAuthID = ptr(strings.TrimSpace(resp.QueueAuthID))
-	job.RemoteHash = ptr(strings.TrimSpace(resp.RemoteHash))
+	remoteHash := strings.TrimSpace(resp.RemoteHash)
+	if remoteHash == "" && job.InfoHash != nil {
+		remoteHash = strings.TrimSpace(*job.InfoHash)
+	}
+	job.RemoteHash = ptr(remoteHash)
 	if strings.TrimSpace(resp.DisplayName) != "" {
 		job.DisplayName = strings.TrimSpace(resp.DisplayName)
 	}
@@ -86,6 +97,18 @@ func (o *Orchestrator) processSubmitJob(ctx context.Context, job *store.Job) err
 	}
 	job.ErrorMessage = nil
 	job.RetryCount = 0
+	if remoteID == "" {
+		now := time.Now().UTC()
+		job.Metadata.QueuedAt = &now
+		job.Metadata.ForceStartLastAttemptAt = nil
+		job.Metadata.ForceStartAcceptedAt = nil
+		job.Metadata.IgnoreQueueCreatedAt = false
+	} else {
+		job.Metadata.QueuedAt = nil
+		job.Metadata.ForceStartLastAttemptAt = nil
+		job.Metadata.ForceStartAcceptedAt = nil
+		job.Metadata.IgnoreQueueCreatedAt = false
+	}
 	nextRun := time.Now().UTC().Add(o.cfg.Workers.PollInterval)
 	job.NextRunAt = &nextRun
 	job.UpdatedAt = time.Now().UTC()
@@ -99,7 +122,8 @@ func (o *Orchestrator) processSubmitJob(ctx context.Context, job *store.Job) err
 			"display_name", job.DisplayName,
 			"next_run_at", nextRun.Format(time.RFC3339Nano),
 		)
-		return o.store.UpdateJobState(ctx, job, store.StateRemoteActive, "remote task created")
+		_, err := o.store.UpdateJobStateIfCurrent(ctx, job, expectedState, store.StateRemoteActive, "remote task created")
+		return err
 	}
 
 	o.log.Info("remote task queued",
@@ -111,10 +135,12 @@ func (o *Orchestrator) processSubmitJob(ctx context.Context, job *store.Job) err
 		"display_name", job.DisplayName,
 		"next_run_at", nextRun.Format(time.RFC3339Nano),
 	)
-	return o.store.UpdateJobState(ctx, job, store.StateRemoteQueued, "remote task queued awaiting active id")
+	_, err = o.store.UpdateJobStateIfCurrent(ctx, job, expectedState, store.StateRemoteQueued, "remote task queued awaiting active id")
+	return err
 }
 
 func (o *Orchestrator) handleSubmitFailure(ctx context.Context, job *store.Job, err error) error {
+	expectedState := job.State
 	message := err.Error()
 	job.ErrorMessage = &message
 	job.UpdatedAt = time.Now().UTC()
@@ -129,11 +155,13 @@ func (o *Orchestrator) handleSubmitFailure(ctx context.Context, job *store.Job, 
 			"next_run_at", nextRun.Format(time.RFC3339Nano),
 			"error", message,
 		)
-		return o.store.UpdateJobState(ctx, job, store.StateSubmitRetry, message)
+		_, updateErr := o.store.UpdateJobStateIfCurrent(ctx, job, expectedState, store.StateSubmitRetry, message)
+		return updateErr
 	}
 	job.NextRunAt = nil
 	o.log.Error("submit failed permanently", "job_id", job.ID, "public_id", job.PublicID, "error", message)
-	return o.store.UpdateJobState(ctx, job, store.StateRemoteFailed, message)
+	_, updateErr := o.store.UpdateJobStateIfCurrent(ctx, job, expectedState, store.StateRemoteFailed, message)
+	return updateErr
 }
 
 func (o *Orchestrator) submitBackoff(retryCount int) time.Duration {

@@ -9,10 +9,11 @@ COPY cmd ./cmd
 COPY internal ./internal
 RUN --mount=type=cache,target=/go/pkg/mod     --mount=type=cache,target=/root/.cache/go-build     VERSION="$(tr -d '\r\n' < VERSION)" && CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -ldflags "-X main.version=$VERSION" -o /out/torboxarr ./cmd/torboxarr
 
-FROM alpine:3.23.3
+FROM --platform=$TARGETPLATFORM alpine:3.23.3
 RUN apk add --no-cache ca-certificates su-exec
 WORKDIR /app
 COPY --from=build /out/torboxarr /app/torboxarr
+RUN ln -s /app/torboxarr /usr/local/bin/torboxarr
 COPY deploy/entrypoint.sh /entrypoint.sh
 RUN chmod 0755 /entrypoint.sh
 EXPOSE 8085

@@ -98,6 +98,9 @@ func (o *Orchestrator) reconcileStartup(ctx context.Context) error {
 	if err := o.store.ReleaseAllClaims(ctx); err != nil {
 		return fmt.Errorf("release stale claims: %w", err)
 	}
+	if err := o.recoverFailedQueuedJobs(ctx); err != nil {
+		return fmt.Errorf("recover failed queued jobs: %w", err)
+	}
 
 	jobs, err := o.store.ListOpenJobs(ctx)
 	if err != nil {
@@ -157,4 +160,76 @@ func (o *Orchestrator) reconcileStartup(ctx context.Context) error {
 	}
 	_, err = o.layout.RemoveOrphanStagingDirs(validIDs)
 	return err
+}
+
+func (o *Orchestrator) recoverFailedQueuedJobs(ctx context.Context) error {
+	jobs, err := o.store.ListRemoteFailedWithQueueTracking(ctx)
+	if err != nil {
+		return err
+	}
+	for _, job := range jobs {
+		if job.DeleteRequested {
+			continue
+		}
+		queued, queueErr := o.torbox.FindQueuedTask(ctx, string(job.SourceType), deref(job.QueuedID), deref(job.QueueAuthID), deref(job.RemoteHash))
+		if queueErr == nil && queued != nil {
+			now := time.Now().UTC()
+			o.prepareQueuedMetadata(job, queued, now)
+			job.ErrorMessage = nil
+			job.Metadata.PollAttempts = 0
+			job.NextRunAt = nil
+			job.RemoteID = nil
+			if queued.Hash != "" {
+				job.RemoteHash = ptr(queued.Hash)
+			}
+			if queued.QueueAuthID != "" {
+				job.QueueAuthID = ptr(queued.QueueAuthID)
+			}
+			job.UpdatedAt = now
+			ok, err := o.store.UpdateJobStateIfCurrent(ctx, job, store.StateRemoteFailed, store.StateRemoteQueued, "startup recovery found task in TorBox queue")
+			if err != nil {
+				return err
+			}
+			if !ok {
+				continue
+			}
+			o.log.Info("recovered failed job in remote queue", "job_id", job.ID, "public_id", job.PublicID, "queued_id", deref(job.QueuedID))
+			continue
+		}
+		if queueErr != nil {
+			o.log.Warn("failed queued-job recovery lookup", "job_id", job.ID, "public_id", job.PublicID, "error", queueErr)
+			continue
+		}
+
+		active, activeErr := o.findActive(ctx, job)
+		if activeErr != nil {
+			o.log.Warn("failed active recovery lookup", "job_id", job.ID, "public_id", job.PublicID, "error", activeErr)
+			continue
+		}
+		if active == nil || active.Failed || active.Inactive {
+			continue
+		}
+		job.ErrorMessage = nil
+		job.Metadata.PollAttempts = 0
+		job.NextRunAt = nil
+		if active.RemoteID != "" {
+			job.RemoteID = ptr(active.RemoteID)
+		}
+		if active.Hash != "" {
+			job.RemoteHash = ptr(active.Hash)
+		}
+		if active.QueueAuthID != "" {
+			job.QueueAuthID = ptr(active.QueueAuthID)
+		}
+		job.UpdatedAt = time.Now().UTC()
+		ok, err := o.store.UpdateJobStateIfCurrent(ctx, job, store.StateRemoteFailed, store.StateRemoteActive, "startup recovery found active TorBox task")
+		if err != nil {
+			return err
+		}
+		if !ok {
+			continue
+		}
+		o.log.Info("recovered failed job as active", "job_id", job.ID, "public_id", job.PublicID, "remote_id", deref(job.RemoteID))
+	}
+	return nil
 }

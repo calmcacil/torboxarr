@@ -19,6 +19,8 @@ const (
 )
 
 type Config struct {
+	UpstreamRemove bool
+
 	Server struct {
 		Address string
 		BaseURL string
@@ -67,16 +69,18 @@ type Config struct {
 	}
 
 	Workers struct {
-		SubmitInterval   time.Duration
-		PollInterval     time.Duration
-		DownloadInterval time.Duration
-		FinalizeInterval time.Duration
-		RemoveInterval   time.Duration
-		PruneInterval    time.Duration
-		SubmitRetryMin   time.Duration
-		SubmitRetryMax   time.Duration
-		RemovedRetention time.Duration
-		BatchSize        int
+		SubmitInterval        time.Duration
+		PollInterval          time.Duration
+		DownloadInterval      time.Duration
+		FinalizeInterval      time.Duration
+		RemoveInterval        time.Duration
+		PruneInterval         time.Duration
+		SubmitRetryMin        time.Duration
+		SubmitRetryMax        time.Duration
+		RemovedRetention      time.Duration
+		RemoteAbsenceAttempts int
+		QueuedForceStartAfter time.Duration
+		BatchSize             int
 	}
 }
 
@@ -85,7 +89,9 @@ func Load() (*Config, error) {
 	if err := loadDotEnv(".env"); err != nil {
 		return nil, err
 	}
-	applyEnv(&cfg)
+	if err := applyEnv(&cfg); err != nil {
+		return nil, err
+	}
 	cfg.applyDerived()
 	if err := cfg.Validate(); err != nil {
 		return nil, err
@@ -123,6 +129,10 @@ func defaultConfig() Config {
 	cfg.Workers.SubmitRetryMin = 15 * time.Second
 	cfg.Workers.SubmitRetryMax = 15 * time.Minute
 	cfg.Workers.RemovedRetention = 30 * 24 * time.Hour
+	cfg.Workers.RemoteAbsenceAttempts = 5
+	// Automatic force-start is opt-in because it sends a state-changing request
+	// to TorBox. Operators can enable it with a positive duration.
+	cfg.Workers.QueuedForceStartAfter = 0
 	cfg.Workers.BatchSize = 25
 	cfg.applyDerived()
 	return cfg
@@ -151,7 +161,7 @@ func (c *Config) applyDerived() {
 	}
 }
 
-func applyEnv(cfg *Config) {
+func applyEnv(cfg *Config) error {
 	setString := func(ptr *string, key string) {
 		if v := strings.TrimSpace(os.Getenv(key)); v != "" {
 			*ptr = v
@@ -167,6 +177,26 @@ func applyEnv(cfg *Config) {
 	setString(&cfg.Auth.QBitPassword, "TORBOXARR_QBIT_PASSWORD")
 	setString(&cfg.Auth.SABAPIKey, "TORBOXARR_SAB_API_KEY")
 	setString(&cfg.Auth.SABNZBKey, "TORBOXARR_SAB_NZB_KEY")
+
+	if v := strings.TrimSpace(os.Getenv("TORBOXARR_UPSTREAM_REMOVE")); v != "" {
+		parsed, err := strconv.ParseBool(v)
+		if err == nil {
+			cfg.UpstreamRemove = parsed
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("TORBOXARR_REMOTE_ABSENCE_ATTEMPTS")); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil {
+			cfg.Workers.RemoteAbsenceAttempts = parsed
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("TORBOXARR_QUEUED_FORCE_START_AFTER")); v != "" {
+		parsed, err := time.ParseDuration(v)
+		if err != nil {
+			return fmt.Errorf("TORBOXARR_QUEUED_FORCE_START_AFTER must be a duration: %w", err)
+		}
+		cfg.Workers.QueuedForceStartAfter = parsed
+	}
+	return nil
 }
 
 func (c *Config) Validate() error {
@@ -185,6 +215,12 @@ func (c *Config) Validate() error {
 		return errors.New("data.completed is required")
 	case c.Auth.QBitUsername == "":
 		return errors.New("auth.qbit_username is required")
+	}
+	if c.Workers.RemoteAbsenceAttempts < 1 {
+		return errors.New("workers.remote_absence_attempts must be positive")
+	}
+	if c.Workers.QueuedForceStartAfter < 0 {
+		return errors.New("TORBOXARR_QUEUED_FORCE_START_AFTER must not be negative")
 	}
 	if err := validateSecret("torbox.api_token", c.TorBox.APIToken); err != nil {
 		return err

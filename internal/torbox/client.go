@@ -4,15 +4,19 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 )
 
 type Client interface {
 	CreateTorrentTask(ctx context.Context, req CreateTorrentTaskRequest) (*CreateTaskResponse, error)
 	CreateUsenetTask(ctx context.Context, req CreateUsenetTaskRequest) (*CreateTaskResponse, error)
 	GetQueuedStatus(ctx context.Context, sourceType string, queuedID string) (*TaskStatus, error)
+	FindQueuedTask(ctx context.Context, sourceType string, queuedID, queueAuthID, remoteHash string) (*TaskStatus, error)
 	GetTaskStatus(ctx context.Context, sourceType string, remoteID string) (*TaskStatus, error)
 	FindActiveTask(ctx context.Context, sourceType string, remoteID, queueAuthID, remoteHash string) (*TaskStatus, error)
+	ForceStartQueuedTask(ctx context.Context, sourceType, queuedID string) error
 	GetDownloadLinks(ctx context.Context, sourceType string, remoteID string) ([]DownloadAsset, error)
+	DeleteTask(ctx context.Context, sourceType string, remoteID string) error
 }
 
 type CreateTorrentTaskRequest struct {
@@ -36,11 +40,12 @@ type CreateUsenetTaskRequest struct {
 }
 
 type CreateTaskResponse struct {
-	RemoteID    string
-	QueuedID    string
-	QueueAuthID string
-	RemoteHash  string
-	DisplayName string
+	RemoteID         string
+	ActiveIDExplicit bool
+	QueuedID         string
+	QueueAuthID      string
+	RemoteHash       string
+	DisplayName      string
 }
 
 type RemoteFile struct {
@@ -68,6 +73,7 @@ type TaskStatus struct {
 	Failed           bool
 	Inactive         bool
 	Error            string
+	QueueCreatedAt   *time.Time
 	Files            []RemoteFile
 }
 
@@ -104,6 +110,29 @@ func MarkRetryable(err error) error {
 func IsRetryable(err error) bool {
 	var retryable *RetryableError
 	return errors.As(err, &retryable)
+}
+
+// ErrTorboxLogical indicates the TorBox API returned a structured error in its
+// response body (typically `{"success":false,"error":"DATABASE_ERROR",...}` on a
+// 500). This most often means the requested task does not exist or is otherwise
+// unrecoverable upstream — but TorBox returns the same shape during a transient
+// backend outage, so callers must NOT treat it as immediately fatal. It is used
+// to distinguish a logical failure from a transport-level retryable error.
+type ErrTorboxLogical struct {
+	Err error
+}
+
+func (e *ErrTorboxLogical) Error() string {
+	return e.Err.Error()
+}
+
+func (e *ErrTorboxLogical) Unwrap() error {
+	return e.Err
+}
+
+func IsTorboxLogical(err error) bool {
+	var logical *ErrTorboxLogical
+	return errors.As(err, &logical)
 }
 
 func RequireRemoteID(remoteID string) error {
