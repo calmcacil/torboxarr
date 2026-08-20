@@ -5,11 +5,11 @@ import (
 	"encoding/base32"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
-	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -103,6 +103,15 @@ func (s *Server) enqueueSubmission(ctx context.Context, req SubmissionRequest) (
 
 	payloadRef := ""
 	payloadDigest := ""
+	payloadDir := ""
+	keepPayload := false
+	defer func() {
+		if payloadDir != "" && !keepPayload {
+			if err := s.layout.RemovePath(payloadDir); err != nil {
+				s.log.Warn("failed to clean rejected submission payload", "job_id", jobID, "error", err)
+			}
+		}
+	}()
 	if req.PayloadBody != nil {
 		name := req.PayloadName
 		if name == "" {
@@ -112,6 +121,7 @@ func (s *Server) enqueueSubmission(ctx context.Context, req SubmissionRequest) (
 		if err != nil {
 			return nil, false, err
 		}
+		payloadDir = s.layout.PayloadDirForJob(jobID)
 	}
 
 	sourceURI := strings.TrimSpace(req.SourceURI)
@@ -122,9 +132,6 @@ func (s *Server) enqueueSubmission(ctx context.Context, req SubmissionRequest) (
 		return nil, false, err
 	}
 	if active != nil {
-		if payloadRef != "" {
-			_ = s.layout.RemovePath(filepath.Dir(payloadRef))
-		}
 		s.log.Info("duplicate submission ignored",
 			"job_id", active.ID,
 			"public_id", active.PublicID,
@@ -145,7 +152,7 @@ func (s *Server) enqueueSubmission(ctx context.Context, req SubmissionRequest) (
 		SourceType:    req.SourceType,
 		ClientKind:    req.ClientKind,
 		Category:      category,
-		State:         store.StateAccepted,
+		State:         store.StateSubmitPending,
 		SubmissionKey: submissionKey,
 		DisplayName:   displayName,
 		BytesTotal:    0,
@@ -153,6 +160,7 @@ func (s *Server) enqueueSubmission(ctx context.Context, req SubmissionRequest) (
 		Metadata:      req.Metadata,
 		CreatedAt:     now,
 		UpdatedAt:     now,
+		NextRunAt:     &now,
 	}
 	if sourceURI != "" {
 		job.SourceURI = &sourceURI
@@ -166,8 +174,26 @@ func (s *Server) enqueueSubmission(ctx context.Context, req SubmissionRequest) (
 	job.StagingPath = &stagingPath
 
 	if err := s.store.CreateJob(ctx, job); err != nil {
+		active, findErr := s.store.FindActiveBySubmissionKey(ctx, submissionKey)
+		if findErr == nil && active != nil {
+			if active.ID == job.ID {
+				keepPayload = true
+			}
+			s.log.Info("duplicate submission ignored",
+				"job_id", active.ID,
+				"public_id", active.PublicID,
+				"client", req.ClientKind,
+				"source_type", req.SourceType,
+				"category", category,
+			)
+			return active, active.ID != job.ID, nil
+		}
+		if findErr != nil {
+			return nil, false, fmt.Errorf("create job: %w (duplicate reconciliation failed: %v)", err, findErr)
+		}
 		return nil, false, err
 	}
+	keepPayload = true
 	s.log.Info("job accepted",
 		"job_id", job.ID,
 		"public_id", job.PublicID,
@@ -178,10 +204,6 @@ func (s *Server) enqueueSubmission(ctx context.Context, req SubmissionRequest) (
 		"has_payload", job.PayloadRef != nil,
 		"has_source_uri", job.SourceURI != nil,
 	)
-	job.NextRunAt = &now
-	if err := s.store.UpdateJobState(ctx, job, store.StateSubmitPending, "queued for remote submission"); err != nil {
-		return nil, false, err
-	}
 	s.log.Debug("job queued for remote submission",
 		"job_id", job.ID,
 		"public_id", job.PublicID,

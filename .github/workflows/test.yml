@@ -51,3 +51,6 @@ jobs:
 
       - name: Build Docker image
         run: docker build -f deploy/Dockerfile -t torboxarr:test .
+
+      - name: Verify CLI is on PATH
+        run: docker run --rm --entrypoint sh torboxarr:test -c 'command -v torboxarr && test -x "$(command -v torboxarr)"'

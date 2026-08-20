@@ -245,7 +245,7 @@ func (c *addClient) submitMagnet(ctx context.Context, category, magnet string) e
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	return c.submit(ctx, req, fmt.Sprintf("submitted magnet with info hash %s to category %q", magnetInfoHash(magnet), category))
+	return c.submit(ctx, req, fmt.Sprintf("submitted magnet with info hash %q to category %q", magnetInfoHash(magnet), category))
 }
 
 func (c *addClient) submitTorrentFile(ctx context.Context, category, torrentPath string) error {
@@ -277,7 +277,7 @@ func (c *addClient) submitTorrentFile(ctx context.Context, category, torrentPath
 	}
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 
-	return c.submit(ctx, req, fmt.Sprintf("submitted torrent %s to category %q", filepath.Base(torrentPath), category))
+	return c.submit(ctx, req, fmt.Sprintf("submitted torrent %q to category %q", filepath.Base(torrentPath), category))
 }
 
 func (c *addClient) submit(ctx context.Context, req *http.Request, confirmation string) error {
@@ -659,7 +659,7 @@ func (c *sabAddClient) submitFile(ctx context.Context, category, nzbPath string)
 	if !safeSABNZOID(nzoID) {
 		return fmt.Errorf("the SAB server rejected the submission: response contained an unsafe NZO ID")
 	}
-	fmt.Printf("submitted NZB file %s to category %q with NZO ID %s\n", filepath.Base(nzbPath), category, nzoID)
+	fmt.Printf("submitted NZB file %q to category %q with NZO ID %s\n", filepath.Base(nzbPath), category, nzoID)
 	return nil
 }
 
@@ -692,7 +692,7 @@ func safeSABNZOID(v string) bool {
 		return false
 	}
 	for _, r := range v {
-		if unicode.IsControl(r) || unicode.IsSpace(r) {
+		if r < '!' || r > '~' || unicode.IsControl(r) || unicode.IsSpace(r) {
 			return false
 		}
 	}
@@ -748,14 +748,7 @@ func parseBencodeValue(data []byte, pos, depth int) (int, bool) {
 	}
 	switch data[pos] {
 	case 'i':
-		pos++
-		for pos < len(data) && data[pos] != 'e' {
-			pos++
-		}
-		if pos >= len(data) {
-			return 0, false
-		}
-		return pos + 1, true
+		return parseBencodeInteger(data, pos)
 	case 'l':
 		pos++
 		for {
@@ -784,12 +777,52 @@ func parseBencodeValue(data []byte, pos, depth int) (int, bool) {
 	}
 }
 
+func parseBencodeInteger(data []byte, pos int) (int, bool) {
+	if pos >= len(data) || data[pos] != 'i' {
+		return 0, false
+	}
+	pos++
+	start := pos
+	if pos < len(data) && data[pos] == '-' {
+		pos++
+		if pos >= len(data) || data[pos] == '0' {
+			return 0, false
+		}
+	}
+	digits := pos
+	for pos < len(data) && data[pos] >= '0' && data[pos] <= '9' {
+		pos++
+	}
+	if pos == digits || pos >= len(data) || data[pos] != 'e' {
+		return 0, false
+	}
+	if data[digits] == '0' && pos-digits > 1 {
+		return 0, false
+	}
+	if start == pos {
+		return 0, false
+	}
+	return pos + 1, true
+}
+
 func parseBencodeString(data []byte, pos int) (int, string, bool) {
+	if pos >= len(data) || data[pos] < '0' || data[pos] > '9' {
+		return 0, "", false
+	}
 	colon := bytes.IndexByte(data[pos:], ':')
 	if colon < 0 {
 		return 0, "", false
 	}
-	length, err := strconv.Atoi(string(data[pos : pos+colon]))
+	lengthText := data[pos : pos+colon]
+	if len(lengthText) > 1 && lengthText[0] == '0' {
+		return 0, "", false
+	}
+	for _, digit := range lengthText {
+		if digit < '0' || digit > '9' {
+			return 0, "", false
+		}
+	}
+	length, err := strconv.Atoi(string(lengthText))
 	if err != nil || length < 0 {
 		return 0, "", false
 	}

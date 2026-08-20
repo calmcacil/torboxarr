@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"fmt"
 	"html"
 	"mime/multipart"
@@ -54,6 +55,11 @@ func (s *Server) handleSABAPI(w http.ResponseWriter, r *http.Request) {
 		}
 		if strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/") {
 			if err := r.ParseMultipartForm(2 << 20); err != nil {
+				var maxBytesErr *http.MaxBytesError
+				if errors.As(err, &maxBytesErr) {
+					writeJSON(w, http.StatusRequestEntityTooLarge, map[string]any{"error": "request body too large"})
+					return
+				}
 				writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid multipart body"})
 				return
 			}

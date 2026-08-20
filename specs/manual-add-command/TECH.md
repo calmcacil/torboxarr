@@ -38,6 +38,10 @@ const addServerAddress = "http://127.0.0.1:8085"
 An internal base-URL parameter remains useful for HTTP tests but is not exposed
 through flags or environment variables.
 
+The container image exposes `/app/torboxarr` through
+`/usr/local/bin/torboxarr` so the documented `docker exec ... torboxarr add`
+form resolves through the standard container `PATH`.
+
 ## Input Model
 
 Represent the selected source explicitly rather than extending a function with
@@ -249,3 +253,6 @@ go test -race -count=1 -p 1 -parallel=1 ./...
   payloads, source metadata, and duplicate handling.
 - Source URIs are redacted from compatibility logs and fallback display names,
   and returned NZO IDs are checked before confirmation output.
+- Job creation and its initial event are atomic, submissions enter directly in
+  the processable `submit_pending` state, and rejected or duplicate upload
+  attempts clean their private payload directories.

@@ -130,7 +130,14 @@ func (s *Store) CreateJob(ctx context.Context, job *Job) error {
 		return fmt.Errorf("marshal metadata: %w", err)
 	}
 
-	_, err = s.execWrite(ctx, `
+	_, err = retrySQLiteBusy(ctx, func() (struct{}, error) {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return struct{}{}, fmt.Errorf("begin job creation: %w", err)
+		}
+		defer tx.Rollback()
+
+		_, err = tx.ExecContext(ctx, `
         INSERT INTO jobs (
             id, public_id, source_type, client_kind, category, state, submission_key,
             remote_id, queued_id, queue_auth_id, remote_hash, display_name, info_hash, source_uri, payload_ref, staging_path,
@@ -139,38 +146,49 @@ func (s *Store) CreateJob(ctx context.Context, job *Job) error {
             created_at, updated_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `,
-		job.ID,
-		job.PublicID,
-		string(job.SourceType),
-		string(job.ClientKind),
-		job.Category,
-		string(job.State),
-		job.SubmissionKey,
-		nullableString(job.RemoteID),
-		nullableString(job.QueuedID),
-		nullableString(job.QueueAuthID),
-		nullableString(job.RemoteHash),
-		job.DisplayName,
-		nullableString(job.InfoHash),
-		nullableString(job.SourceURI),
-		nullableString(job.PayloadRef),
-		nullableString(job.StagingPath),
-		nullableString(job.CompletedPath),
-		job.BytesTotal,
-		job.BytesDone,
-		nullableString(job.ErrorMessage),
-		job.RetryCount,
-		nullableTime(job.NextRunAt),
-		nullableString(job.LastRemoteStatus),
-		string(metadataJSON),
-		boolToInt(job.DeleteRequested),
-		formatTime(job.CreatedAt),
-		formatTime(job.UpdatedAt),
-	)
-	if err != nil {
-		return fmt.Errorf("insert job: %w", err)
-	}
-	return s.AppendEvent(ctx, job.ID, nil, &job.State, "job created")
+			job.ID,
+			job.PublicID,
+			string(job.SourceType),
+			string(job.ClientKind),
+			job.Category,
+			string(job.State),
+			job.SubmissionKey,
+			nullableString(job.RemoteID),
+			nullableString(job.QueuedID),
+			nullableString(job.QueueAuthID),
+			nullableString(job.RemoteHash),
+			job.DisplayName,
+			nullableString(job.InfoHash),
+			nullableString(job.SourceURI),
+			nullableString(job.PayloadRef),
+			nullableString(job.StagingPath),
+			nullableString(job.CompletedPath),
+			job.BytesTotal,
+			job.BytesDone,
+			nullableString(job.ErrorMessage),
+			job.RetryCount,
+			nullableTime(job.NextRunAt),
+			nullableString(job.LastRemoteStatus),
+			string(metadataJSON),
+			boolToInt(job.DeleteRequested),
+			formatTime(job.CreatedAt),
+			formatTime(job.UpdatedAt),
+		)
+		if err != nil {
+			return struct{}{}, fmt.Errorf("insert job: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `
+            INSERT INTO job_events (job_id, from_state, to_state, message, created_at)
+            VALUES (?, ?, ?, ?, ?)
+        `, job.ID, nil, string(job.State), "job created", formatTime(s.now())); err != nil {
+			return struct{}{}, fmt.Errorf("append job event: %w", err)
+		}
+		if err := tx.Commit(); err != nil {
+			return struct{}{}, fmt.Errorf("commit job creation: %w", err)
+		}
+		return struct{}{}, nil
+	})
+	return err
 }
 
 func (s *Store) UpdateJob(ctx context.Context, job *Job) error {

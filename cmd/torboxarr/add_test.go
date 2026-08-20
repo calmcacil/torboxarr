@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"mime"
@@ -462,6 +463,38 @@ func TestRunAddTorrentFile_Success(t *testing.T) {
 	}
 }
 
+func TestRunAddFileConfirmationsRemainOneLine(t *testing.T) {
+	torrentServer, _ := newAddServer(t, defaultAddServerOptions())
+	withAddPassword(t)
+	torrentPath := filepath.Join(t.TempDir(), "sample\nname.torrent")
+	if err := os.WriteFile(torrentPath, validTorrentBytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	torrentOutput := captureOutput(t, func() {
+		if err := runAddAt(context.Background(), torrentServer.URL, "sonarr", "", torrentPath); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if strings.Count(torrentOutput, "\n") != 1 || !strings.Contains(torrentOutput, `sample\nname.torrent`) {
+		t.Fatalf("torrent confirmation is not one escaped line: %q", torrentOutput)
+	}
+
+	sabServer, _ := newSABAddServer(t, defaultSABAddServerOptions())
+	withSABAPIKey(t)
+	nzbPath := filepath.Join(t.TempDir(), "sample\nname.nzb")
+	if err := os.WriteFile(nzbPath, []byte(`<nzb></nzb>`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	nzbOutput := captureOutput(t, func() {
+		if err := runAddInputAt(context.Background(), sabServer.URL, addInput{Category: "tv", NZBPath: nzbPath}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if strings.Count(nzbOutput, "\n") != 1 || !strings.Contains(nzbOutput, `sample\nname.nzb`) {
+		t.Fatalf("NZB confirmation is not one escaped line: %q", nzbOutput)
+	}
+}
+
 func TestRunAdd_CategoryUnknown(t *testing.T) {
 	srv, server := newAddServer(t, defaultAddServerOptions())
 	withAddPassword(t)
@@ -640,6 +673,11 @@ func TestIsValidTorrent(t *testing.T) {
 		"d4:infoe",
 		"d4:infoxx",
 		"d4:infodee trailing",
+		"d4:infod1:ai-0eee",
+		"d4:infod1:ai03eee",
+		"d4:infod1:ai+3eee",
+		"d04:infodee",
+		"d4:infofoo:bare",
 	}
 	for _, data := range invalid {
 		if isValidTorrent([]byte(data)) {
@@ -671,6 +709,25 @@ func TestRunAddCommand_RejectsMixedSources(t *testing.T) {
 	err := runAddCommand(context.Background(), args)
 	if err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
 		t.Fatalf("expected mixed-source error, got %v", err)
+	}
+}
+
+func TestRunAddCommand_RejectsPositionalArgumentsBeforeNetwork(t *testing.T) {
+	for _, args := range [][]string{
+		{"--category", "tv", "unexpected"},
+		{"--category", "tv", "--magnet", "magnet:?xt=urn:btih:abc", "unexpected"},
+	} {
+		err := runAddCommand(context.Background(), args)
+		if err == nil || !strings.Contains(err.Error(), "unexpected argument") {
+			t.Fatalf("args %v: expected positional argument error, got %v", args, err)
+		}
+	}
+}
+
+func TestRunAddCommand_RejectsBlankSourceFlags(t *testing.T) {
+	err := runAddCommand(context.Background(), []string{"--category", "tv", "--nzb", "   "})
+	if err == nil || !strings.Contains(err.Error(), "exactly one") {
+		t.Fatalf("expected blank source error, got %v", err)
 	}
 }
 
@@ -722,6 +779,40 @@ func TestValidateNZBFile_RejectsOversizedFile(t *testing.T) {
 	}
 }
 
+func TestValidateTorrentFile_RejectsEmptyOversizedAndNonRegular(t *testing.T) {
+	empty := writeTempFile(t, "")
+	if err := validateTorrentFile(empty); err == nil || !strings.Contains(err.Error(), "empty") {
+		t.Fatalf("empty torrent error = %v", err)
+	}
+
+	oversized := filepath.Join(t.TempDir(), "large.torrent")
+	file, err := os.Create(oversized)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Truncate(maxTorrentFileBytes + 1); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateTorrentFile(oversized); err == nil || !strings.Contains(err.Error(), "too large") {
+		t.Fatalf("oversized torrent error = %v", err)
+	}
+
+	if err := validateTorrentFile(os.DevNull); err == nil || !strings.Contains(err.Error(), "regular file") {
+		t.Fatalf("non-regular torrent error = %v", err)
+	}
+}
+
+func TestIsValidTorrent_RejectsDeeplyNestedInput(t *testing.T) {
+	data := "d4:info" + strings.Repeat("l", 18) + strings.Repeat("e", 18) + "e"
+	if isValidTorrent([]byte(data)) {
+		t.Fatal("deeply nested torrent was accepted")
+	}
+}
+
 func TestValidateNZBFile_RejectsMissingDirectoryAndNonRegular(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "missing.nzb")
 	if err := validateNZBFile(missing); err == nil || !strings.Contains(err.Error(), "does not exist") {
@@ -733,7 +824,7 @@ func TestValidateNZBFile_RejectsMissingDirectoryAndNonRegular(t *testing.T) {
 		t.Fatalf("directory error = %v", err)
 	}
 
-	if err := validateNZBFile("/dev/null"); err == nil || !strings.Contains(err.Error(), "regular file") {
+	if err := validateNZBFile(os.DevNull); err == nil || !strings.Contains(err.Error(), "regular file") {
 		t.Fatalf("non-regular error = %v", err)
 	}
 }
@@ -798,7 +889,7 @@ func TestSafeSABNZOID(t *testing.T) {
 			t.Errorf("safeSABNZOID(%q) = false, want true", id)
 		}
 	}
-	for _, id := range []string{"", "has space", "has\nnewline", strings.Repeat("x", 257)} {
+	for _, id := range []string{"", "has space", "has\nnewline", "unicode-\u00e9", strings.Repeat("x", 257)} {
 		if safeSABNZOID(id) {
 			t.Errorf("safeSABNZOID(%q) = true, want false", id)
 		}
@@ -940,6 +1031,57 @@ func newManualAddRouter(t *testing.T) (*httptest.Server, *store.Store) {
 	return httpServer, st
 }
 
+func assertQBitQueueCount(t *testing.T, baseURL string, want int) {
+	t.Helper()
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &http.Client{Jar: jar}
+	login := url.Values{"username": {"admin"}, "password": {"password"}}
+	resp, err := client.Post(baseURL+"/api/v2/auth/login", "application/x-www-form-urlencoded", strings.NewReader(login.Encode()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("qBit login status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	resp, err = client.Get(baseURL + "/api/v2/torrents/info")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var torrents []json.RawMessage
+	if err := json.NewDecoder(resp.Body).Decode(&torrents); err != nil {
+		t.Fatal(err)
+	}
+	if len(torrents) != want {
+		t.Fatalf("qBit queue contains %d jobs, want %d", len(torrents), want)
+	}
+}
+
+func assertSABQueueCount(t *testing.T, baseURL string, want int) {
+	t.Helper()
+	query := url.Values{"mode": {"queue"}, "output": {"json"}, "apikey": {"sab-secret"}}
+	resp, err := http.Get(baseURL + "/sabnzbd/api?" + query.Encode())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var result struct {
+		Queue struct {
+			Slots []json.RawMessage `json:"slots"`
+		} `json:"queue"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Queue.Slots) != want {
+		t.Fatalf("SAB queue contains %d jobs, want %d", len(result.Queue.Slots), want)
+	}
+}
+
 func TestRunAddNZB_RealRouterPersistsPayload(t *testing.T) {
 	srv, st := newManualAddRouter(t)
 	withSABAPIKey(t)
@@ -981,6 +1123,7 @@ func TestRunAddNZB_RealRouterPersistsPayload(t *testing.T) {
 	if len(jobs) != 1 {
 		t.Fatalf("duplicate submission created %d jobs, want 1", len(jobs))
 	}
+	assertSABQueueCount(t, srv.URL, 1)
 }
 
 func TestRunAddMagnet_RealRouterPersistsJob(t *testing.T) {
@@ -1006,6 +1149,17 @@ func TestRunAddMagnet_RealRouterPersistsJob(t *testing.T) {
 	if job.InfoHash == nil || *job.InfoHash != "0123456789abcdef0123456789abcdef01234567" || job.PayloadRef != nil {
 		t.Fatalf("job hash/payload = %v/%v, want normalized hash and no payload", job.InfoHash, job.PayloadRef)
 	}
+	if err := runAddAt(context.Background(), srv.URL, "torboxarr", magnet, ""); err != nil {
+		t.Fatalf("expected duplicate submission response success, got %v", err)
+	}
+	jobs, err = st.ListVisibleClientJobs(context.Background(), store.ClientKindQBit, "torboxarr", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("duplicate magnet created %d jobs, want 1", len(jobs))
+	}
+	assertQBitQueueCount(t, srv.URL, 1)
 }
 
 func TestRunAddTorrent_RealRouterPersistsPayload(t *testing.T) {
@@ -1038,6 +1192,17 @@ func TestRunAddTorrent_RealRouterPersistsPayload(t *testing.T) {
 	if !bytes.Equal(payload, validTorrentBytes()) {
 		t.Fatalf("stored payload does not match torrent input")
 	}
+	if err := runAddAt(context.Background(), srv.URL, "torboxarr", "", path); err != nil {
+		t.Fatalf("expected duplicate submission response success, got %v", err)
+	}
+	jobs, err = st.ListVisibleClientJobs(context.Background(), store.ClientKindQBit, "torboxarr", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("duplicate torrent created %d jobs, want 1", len(jobs))
+	}
+	assertQBitQueueCount(t, srv.URL, 1)
 }
 
 func TestRunAddNZB_ResponseDoesNotLeakAPIKey(t *testing.T) {
