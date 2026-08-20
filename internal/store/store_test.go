@@ -175,6 +175,8 @@ func TestUpdateJobState_RemoveRequestRetainsStaleWorkerCleanupData(t *testing.T)
 	ctx := context.Background()
 
 	job := makeJob("remove-merge-001", "pub-remove-merge-001", store.StateSubmitPending)
+	oldRemoteID := "100"
+	job.RemoteID = &oldRemoteID
 	if err := st.CreateJob(ctx, job); err != nil {
 		t.Fatal(err)
 	}

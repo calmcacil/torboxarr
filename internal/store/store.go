@@ -281,11 +281,11 @@ func (s *Store) UpdateJobState(ctx context.Context, job *Job, next JobState, mes
 			// never let the stale worker revive or otherwise rewrite the job.
 			if _, err := s.execWrite(ctx, `
                 UPDATE jobs
-                SET remote_id = COALESCE(remote_id, NULLIF(?, '')),
-                    queued_id = COALESCE(queued_id, NULLIF(?, '')),
-                    queue_auth_id = COALESCE(queue_auth_id, NULLIF(?, '')),
-                    remote_hash = COALESCE(remote_hash, NULLIF(?, '')),
-                    completed_path = COALESCE(completed_path, NULLIF(?, '')),
+                SET remote_id = COALESCE(NULLIF(?, ''), remote_id),
+                    queued_id = COALESCE(NULLIF(?, ''), queued_id),
+                    queue_auth_id = COALESCE(NULLIF(?, ''), queue_auth_id),
+                    remote_hash = COALESCE(NULLIF(?, ''), remote_hash),
+                    completed_path = COALESCE(NULLIF(?, ''), completed_path),
                     updated_at = ?
                 WHERE id = ? AND state = 'remove_pending'
             `,
