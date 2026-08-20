@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -91,13 +92,19 @@ func (c *HTTPClient) do(ctx context.Context, method, path string, body io.Reader
 		// logical error so callers can distinguish it from a transport-level
 		// failure, but it is still subject to retry/escalation caps.
 		var env apiEnvelope
-		if len(bytes.TrimSpace(raw)) > 0 && json.Unmarshal(raw, &env) == nil && !env.Success {
+		if resp.StatusCode >= 500 && len(bytes.TrimSpace(raw)) > 0 && json.Unmarshal(raw, &env) == nil && !env.Success {
 			return nil, &ErrTorboxLogical{Err: fmt.Errorf("torbox status %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))}
 		}
-		return nil, MarkRetryable(fmt.Errorf("torbox status %d: %s", resp.StatusCode, strings.TrimSpace(string(raw))))
+		return nil, MarkRetryable(&HTTPStatusError{
+			StatusCode: resp.StatusCode,
+			Message:    fmt.Sprintf("torbox status %d: %s", resp.StatusCode, strings.TrimSpace(string(raw))),
+		})
 	}
 	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("torbox status %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+		return nil, &HTTPStatusError{
+			StatusCode: resp.StatusCode,
+			Message:    fmt.Sprintf("torbox status %d: %s", resp.StatusCode, strings.TrimSpace(string(raw))),
+		}
 	}
 
 	var env apiEnvelope
@@ -107,8 +114,12 @@ func (c *HTTPClient) do(ctx context.Context, method, path string, body io.Reader
 	if err := json.Unmarshal(raw, &env); err != nil {
 		return nil, fmt.Errorf("decode response envelope: %w", err)
 	}
-	if !env.Success && env.Error != nil {
-		return nil, fmt.Errorf("torbox api error: %v (%s)", env.Error, env.Detail)
+	if !env.Success {
+		message := "torbox api returned success=false"
+		if env.Error != nil || env.Detail != "" {
+			message = fmt.Sprintf("torbox api error: %v (%s)", env.Error, env.Detail)
+		}
+		return nil, &ErrTorboxLogical{Err: errors.New(message)}
 	}
 	return &env, nil
 }
@@ -152,8 +163,16 @@ func isNetRetryable(err error) bool {
 	if err == nil {
 		return false
 	}
-	if ne, ok := err.(net.Error); ok && ne.Timeout() {
+	var ne net.Error
+	if errors.As(err, &ne) && (ne.Timeout() || ne.Temporary()) {
 		return true
 	}
-	return strings.Contains(strings.ToLower(err.Error()), "timeout")
+	lower := strings.ToLower(err.Error())
+	return strings.Contains(lower, "timeout") ||
+		strings.Contains(lower, "connection refused") ||
+		strings.Contains(lower, "connection reset") ||
+		strings.Contains(lower, "broken pipe") ||
+		strings.Contains(lower, "no such host") ||
+		strings.Contains(lower, "network is unreachable") ||
+		strings.Contains(lower, "eof")
 }

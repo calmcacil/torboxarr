@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -318,23 +320,30 @@ func TestProcessRemoveJob_UpstreamDeleteRetriesThenEscalates(t *testing.T) {
 
 	ctx := context.Background()
 	// Simulate the remover ticking repeatedly while the upstream API is down.
-	// Attempts 1-4 must return an error (retry); attempt 5 must escalate and
-	// proceed with local cleanup, transitioning the job to StateRemoved.
+	// Attempts 1-4 retain local payloads and schedule another run; attempt 5
+	// escalates and proceeds with local cleanup.
 	for attempt := 1; attempt <= maxUpstreamDeleteAttempts; attempt++ {
 		job, err := env.store.GetJobByID(ctx, "r1")
 		if err != nil {
 			t.Fatal(err)
 		}
 		err = env.orch.processRemoveJob(ctx, job)
-		switch {
-		case attempt < maxUpstreamDeleteAttempts:
-			if err == nil {
-				t.Fatalf("attempt %d: expected retryable error, got nil", attempt)
+		if err != nil {
+			t.Fatalf("attempt %d: processRemoveJob: %v", attempt, err)
+		}
+		got, err := env.store.GetJobByID(ctx, "r1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if attempt < maxUpstreamDeleteAttempts {
+			if got.State != store.StateRemovePending {
+				t.Fatalf("attempt %d: state=%s, want remove_pending", attempt, got.State)
 			}
-		default:
-			if err != nil {
-				t.Fatalf("attempt %d: expected escalation (no error), got %v", attempt, err)
+			if _, err := os.Stat(filepath.Join(env.dir, "completed", "r1", "file.mkv")); err != nil {
+				t.Fatalf("attempt %d: local payload should remain: %v", attempt, err)
 			}
+		} else if got.State != store.StateRemoved {
+			t.Fatalf("attempt %d: state=%s, want removed", attempt, got.State)
 		}
 	}
 
@@ -349,8 +358,11 @@ func TestProcessRemoveJob_UpstreamDeleteRetriesThenEscalates(t *testing.T) {
 	if got.State != store.StateRemoved {
 		t.Errorf("after max attempts the job must finalize locally; state=%s", got.State)
 	}
-	if got.Metadata.UpstreamDeleteAttempts != maxUpstreamDeleteAttempts {
-		t.Errorf("expected UpstreamDeleteAttempts=%d, got %d", maxUpstreamDeleteAttempts, got.Metadata.UpstreamDeleteAttempts)
+	if got.Metadata.ActiveRemoval.Attempts != maxUpstreamDeleteAttempts {
+		t.Errorf("expected active removal attempts=%d, got %d", maxUpstreamDeleteAttempts, got.Metadata.ActiveRemoval.Attempts)
+	}
+	if got.Metadata.ActiveRemoval.Outcome != store.UpstreamRemovalExhausted {
+		t.Errorf("active removal outcome=%q, want %q", got.Metadata.ActiveRemoval.Outcome, store.UpstreamRemovalExhausted)
 	}
 	if _, err := os.Stat(filepath.Join(env.dir, "completed", "r1", "file.mkv")); !os.IsNotExist(err) {
 		t.Error("completed file should have been removed locally after escalation")
@@ -361,15 +373,22 @@ func TestProcessRemoveJob_QueuedJobNoRemoteIDSkipsUpstream(t *testing.T) {
 	env := newRemoveTestEnv(t)
 	env.orch.cfg.UpstreamRemove = true
 
-	called := false
+	var activeCalls, queuedCalls int
 	env.mock.DeleteTaskFn = func(_ context.Context, _, _ string) error {
-		called = true
+		activeCalls++
+		return nil
+	}
+	env.mock.DeleteQueuedTaskFn = func(_ context.Context, _, queuedID string) error {
+		queuedCalls++
+		if queuedID != "42" {
+			t.Errorf("queued id = %q, want 42", queuedID)
+		}
 		return nil
 	}
 
 	// Queued job: only a queued_id, no remote_id yet.
 	job := env.insertRemovePendingJob(t, "q1", "", store.SourceTypeTorrent)
-	job.QueuedID = ptr("some-queue-auth-id")
+	job.QueuedID = ptr("42")
 
 	ctx := context.Background()
 	if err := env.store.UpdateJob(ctx, job); err != nil {
@@ -387,8 +406,11 @@ func TestProcessRemoveJob_QueuedJobNoRemoteIDSkipsUpstream(t *testing.T) {
 		env.orch.releaseJobClaim(ctx, "remover", j.ID)
 	}
 
-	if called {
-		t.Error("upstream delete must be skipped when there is no remote_id (queued job)")
+	if activeCalls != 0 {
+		t.Errorf("active delete calls = %d, want 0 for queued-only job", activeCalls)
+	}
+	if queuedCalls != 1 {
+		t.Errorf("queued delete calls = %d, want 1", queuedCalls)
 	}
 	got, err := env.store.GetJobByID(ctx, "q1")
 	if err != nil {
@@ -440,5 +462,178 @@ func TestRunRemover_ConcurrentClaims(t *testing.T) {
 	}
 	if job.State != store.StateRemoved {
 		t.Errorf("expected StateRemoved, got %s", job.State)
+	}
+}
+
+func TestProcessRemoveJob_BothViewsDeleteIndependently(t *testing.T) {
+	env := newRemoveTestEnv(t)
+	env.orch.cfg.UpstreamRemove = true
+	var operations []string
+	var activeCalls, queuedCalls int
+	env.mock.FindActiveTaskFn = func(_ context.Context, _, remoteID, _, _ string) (*torbox.TaskStatus, error) {
+		operations = append(operations, "lookup-active")
+		return &torbox.TaskStatus{RemoteID: remoteID}, nil
+	}
+	env.mock.FindQueuedTaskFn = func(_ context.Context, _, queuedID, _, _ string) (*torbox.TaskStatus, error) {
+		operations = append(operations, "lookup-queued")
+		return &torbox.TaskStatus{QueuedID: queuedID}, nil
+	}
+	env.mock.DeleteTaskFn = func(_ context.Context, _, _ string) error {
+		operations = append(operations, "delete-active")
+		activeCalls++
+		return nil
+	}
+	env.mock.DeleteQueuedTaskFn = func(_ context.Context, _, _ string) error {
+		operations = append(operations, "delete-queued")
+		queuedCalls++
+		return nil
+	}
+
+	job := env.insertRemovePendingJob(t, "both-views", "101", store.SourceTypeTorrent)
+	job.QueuedID = ptr("202")
+	if err := env.store.UpdateJob(context.Background(), job); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.orch.processRemoveJob(context.Background(), job); err != nil {
+		t.Fatalf("processRemoveJob: %v", err)
+	}
+
+	if activeCalls != 1 || queuedCalls != 1 {
+		t.Fatalf("delete calls = active:%d queued:%d, want 1 each", activeCalls, queuedCalls)
+	}
+	wantOperations := []string{"lookup-active", "lookup-queued", "delete-active", "delete-queued"}
+	if !reflect.DeepEqual(operations, wantOperations) {
+		t.Fatalf("operations = %v, want %v", operations, wantOperations)
+	}
+	got, err := env.store.GetJobByID(context.Background(), job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Metadata.ActiveRemoval.Outcome != store.UpstreamRemovalDeleted || got.Metadata.QueuedRemoval.Outcome != store.UpstreamRemovalDeleted {
+		t.Fatalf("outcomes = active:%q queued:%q, want deleted for both", got.Metadata.ActiveRemoval.Outcome, got.Metadata.QueuedRemoval.Outcome)
+	}
+}
+
+func TestProcessRemoveJob_PartialSuccessRetriesOnlyRemainingView(t *testing.T) {
+	env := newRemoveTestEnv(t)
+	env.orch.cfg.UpstreamRemove = true
+	var activeCalls, queuedCalls int
+	env.mock.FindActiveTaskFn = func(_ context.Context, _, remoteID, _, _ string) (*torbox.TaskStatus, error) {
+		return &torbox.TaskStatus{RemoteID: remoteID}, nil
+	}
+	env.mock.FindQueuedTaskFn = func(_ context.Context, _, queuedID, _, _ string) (*torbox.TaskStatus, error) {
+		return &torbox.TaskStatus{QueuedID: queuedID}, nil
+	}
+	env.mock.DeleteTaskFn = func(_ context.Context, _, _ string) error {
+		activeCalls++
+		return nil
+	}
+	env.mock.DeleteQueuedTaskFn = func(_ context.Context, _, _ string) error {
+		queuedCalls++
+		return torbox.MarkRetryable(errors.New("queue unavailable"))
+	}
+
+	job := env.insertRemovePendingJob(t, "partial-view", "301", store.SourceTypeTorrent)
+	job.QueuedID = ptr("302")
+	if err := env.store.UpdateJob(context.Background(), job); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.orch.processRemoveJob(context.Background(), job); err != nil {
+		t.Fatalf("first processRemoveJob: %v", err)
+	}
+	if activeCalls != 1 || queuedCalls != 1 {
+		t.Fatalf("first delete calls = active:%d queued:%d, want 1 each", activeCalls, queuedCalls)
+	}
+	got, err := env.store.GetJobByID(context.Background(), job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != store.StateRemovePending {
+		t.Fatalf("first state = %s, want remove_pending", got.State)
+	}
+
+	env.mock.DeleteQueuedTaskFn = func(_ context.Context, _, _ string) error {
+		queuedCalls++
+		return nil
+	}
+	if err := env.orch.processRemoveJob(context.Background(), got); err != nil {
+		t.Fatalf("second processRemoveJob: %v", err)
+	}
+	if activeCalls != 1 || queuedCalls != 2 {
+		t.Fatalf("second delete calls = active:%d queued:%d, want active once and queued twice", activeCalls, queuedCalls)
+	}
+	got, err = env.store.GetJobByID(context.Background(), job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != store.StateRemoved {
+		t.Fatalf("second state = %s, want removed", got.State)
+	}
+}
+
+func TestProcessRemoveJob_AlreadyAbsentDoesNotWarn(t *testing.T) {
+	env := newRemoveTestEnv(t)
+	env.orch.cfg.UpstreamRemove = true
+	env.mock.FindActiveTaskFn = func(context.Context, string, string, string, string) (*torbox.TaskStatus, error) {
+		return nil, nil
+	}
+	env.mock.FindQueuedTaskFn = func(context.Context, string, string, string, string) (*torbox.TaskStatus, error) {
+		return nil, nil
+	}
+	env.mock.DeleteTaskFn = func(context.Context, string, string) error {
+		t.Fatal("active delete must not be called for an absent task")
+		return nil
+	}
+	env.mock.DeleteQueuedTaskFn = func(context.Context, string, string) error {
+		t.Fatal("queued delete must not be called for an absent task")
+		return nil
+	}
+
+	job := env.insertRemovePendingJob(t, "absent-view", "401", store.SourceTypeTorrent)
+	job.QueuedID = ptr("402")
+	if err := env.store.UpdateJob(context.Background(), job); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.orch.processRemoveJob(context.Background(), job); err != nil {
+		t.Fatalf("processRemoveJob: %v", err)
+	}
+	got, err := env.store.GetJobByID(context.Background(), job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ErrorMessage != nil {
+		t.Fatalf("ErrorMessage = %v, want nil for already-absent cleanup", got.ErrorMessage)
+	}
+	if got.Metadata.ActiveRemoval.Outcome != store.UpstreamRemovalAbsent || got.Metadata.QueuedRemoval.Outcome != store.UpstreamRemovalAbsent {
+		t.Fatalf("outcomes = active:%q queued:%q, want absent for both", got.Metadata.ActiveRemoval.Outcome, got.Metadata.QueuedRemoval.Outcome)
+	}
+}
+
+func TestProcessRemoveJob_DefinitiveRejectionPersistsWarning(t *testing.T) {
+	env := newRemoveTestEnv(t)
+	env.orch.cfg.UpstreamRemove = true
+	env.mock.FindActiveTaskFn = func(_ context.Context, _, remoteID, _, _ string) (*torbox.TaskStatus, error) {
+		return &torbox.TaskStatus{RemoteID: remoteID}, nil
+	}
+	env.mock.DeleteTaskFn = func(context.Context, string, string) error {
+		return errors.New("bad request")
+	}
+
+	job := env.insertRemovePendingJob(t, "reject-view", "501", store.SourceTypeTorrent)
+	if err := env.orch.processRemoveJob(context.Background(), job); err != nil {
+		t.Fatalf("processRemoveJob: %v", err)
+	}
+	got, err := env.store.GetJobByID(context.Background(), job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != store.StateRemoved {
+		t.Fatalf("state = %s, want removed", got.State)
+	}
+	if got.ErrorMessage == nil || !strings.Contains(*got.ErrorMessage, "active") {
+		t.Fatalf("ErrorMessage = %v, want active cleanup warning", got.ErrorMessage)
+	}
+	if got.Metadata.ActiveRemoval.Outcome != store.UpstreamRemovalRejected {
+		t.Fatalf("active outcome = %q, want rejected", got.Metadata.ActiveRemoval.Outcome)
 	}
 }

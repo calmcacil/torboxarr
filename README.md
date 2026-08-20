@@ -73,9 +73,9 @@ Docker-specific runtime variables used by the bundled compose file. Set these to
 
 #### Removing downloads from TorBox
 
-By default TorBoxarr only deletes the local copy when a download is removed; the entry stays in your TorBox account. Set `TORBOXARR_UPSTREAM_REMOVE=true` to also delete the matching task from TorBox when a job is removed. This keeps your TorBox cache from filling up with entries that the *arr apps have already imported and discarded.
+By default TorBoxarr only deletes the local copy when a download is removed; the entry stays in your TorBox account. Set `TORBOXARR_UPSTREAM_REMOVE=true` to reconcile and delete matching active and queued representations from TorBox when a job is removed. This keeps your TorBox cache from filling up with entries that the *arr apps have already imported and discarded.
 
-The upstream delete happens as part of the local removal: if it fails (for example, a transient TorBox API error) TorBoxarr logs a warning and still cleans up the local files, so a stuck remote entry never blocks local cleanup. Check the logs for `upstream torbox task deleted` to confirm the remote entry was removed, or `torbox content retained` if it was skipped or failed.
+Upstream cleanup is bounded and idempotent. TorBoxarr confirms each representation before deleting it, retries uncertain failures up to five times, and retains local payloads while a retry remains available. After retry exhaustion, a definitive rejection, or missing safe identity, it cleans up locally and records an operator-visible warning on the removed job. Already-absent representations complete without a warning. Check the logs for `job removed locally and upstream` to confirm full cleanup, or `job removed locally; upstream cleanup incomplete` when TorBox content may remain.
 
 ### Connecting Sonarr/Radarr / Download Clients
 

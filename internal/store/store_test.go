@@ -143,6 +143,55 @@ func TestUpdateJobState(t *testing.T) {
 	}
 }
 
+func TestUpdateJobState_RemoveRequestWinsOverStaleWorker(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	job := makeJob("remove-wins-001", "pub-remove-wins-001", store.StateRemoteActive)
+	if err := st.CreateJob(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	stale := *job
+
+	job.DeleteRequested = true
+	if err := st.UpdateJobState(ctx, job, store.StateRemovePending, "remove requested"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpdateJobState(ctx, &stale, store.StateRemoteFailed, "stale poll result"); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := st.GetJobByID(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != store.StateRemovePending {
+		t.Fatalf("State = %q, want %q", got.State, store.StateRemovePending)
+	}
+}
+
+func TestUpdateJobState_RemoverCanRecordFailure(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	job := makeJob("remove-failed-001", "pub-remove-failed-001", store.StateRemovePending)
+	job.DeleteRequested = true
+	if err := st.CreateJob(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpdateJobState(ctx, job, store.StateFailed, "unsafe local path"); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := st.GetJobByID(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != store.StateFailed {
+		t.Fatalf("State = %q, want %q", got.State, store.StateFailed)
+	}
+}
+
 // ─── FindActiveBySubmissionKey ───────────────────────────────────────────────
 
 func TestFindActiveBySubmissionKey(t *testing.T) {

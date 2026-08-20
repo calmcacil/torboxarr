@@ -174,17 +174,26 @@ func (s *Store) CreateJob(ctx context.Context, job *Job) error {
 }
 
 func (s *Store) UpdateJob(ctx context.Context, job *Job) error {
+	_, err := s.updateJob(ctx, job)
+	return err
+}
+
+func (s *Store) updateJob(ctx context.Context, job *Job) (int64, error) {
 	metadataJSON, err := json.Marshal(job.Metadata)
 	if err != nil {
-		return fmt.Errorf("marshal metadata: %w", err)
+		return 0, fmt.Errorf("marshal metadata: %w", err)
 	}
 
-	_, err = s.execWrite(ctx, `
+	result, err := s.execWrite(ctx, `
         UPDATE jobs
         SET source_type = ?,
             client_kind = ?,
             category = ?,
-            state = ?,
+            state = CASE
+                WHEN state = 'removed' THEN 'removed'
+                WHEN delete_requested = 1 AND ? NOT IN ('remove_pending', 'removed') AND ? = 0 THEN 'remove_pending'
+                ELSE ?
+            END,
             submission_key = ?,
             remote_id = ?,
             queued_id = ?,
@@ -203,15 +212,21 @@ func (s *Store) UpdateJob(ctx context.Context, job *Job) error {
             next_run_at = ?,
             last_remote_status = ?,
             metadata_json = ?,
-            delete_requested = ?,
-            claimed_by = NULL,
-            claimed_at = NULL,
+            delete_requested = CASE WHEN delete_requested = 1 THEN 1 ELSE ? END,
             updated_at = ?
         WHERE id = ?
+          AND (state != 'removed' OR ? IN ('removed'))
+          AND (
+              delete_requested = 0 OR
+              ? IN ('remove_pending', 'removed') OR
+              (? = 'failed' AND ? = 1)
+          )
     `,
 		string(job.SourceType),
 		string(job.ClientKind),
 		job.Category,
+		string(job.State),
+		boolToInt(job.DeleteRequested),
 		string(job.State),
 		job.SubmissionKey,
 		nullableString(job.RemoteID),
@@ -234,20 +249,37 @@ func (s *Store) UpdateJob(ctx context.Context, job *Job) error {
 		boolToInt(job.DeleteRequested),
 		formatTime(job.UpdatedAt),
 		job.ID,
+		string(job.State),
+		string(job.State),
+		string(job.State),
+		boolToInt(job.DeleteRequested),
 	)
 	if err != nil {
-		return fmt.Errorf("update job: %w", err)
+		return 0, fmt.Errorf("update job: %w", err)
 	}
-	return nil
+	affected, _ := result.RowsAffected()
+	return affected, nil
 }
 
 func (s *Store) UpdateJobState(ctx context.Context, job *Job, next JobState, message string) error {
 	prev := job.State
 	job.State = next
 	job.UpdatedAt = s.now()
-	if err := s.UpdateJob(ctx, job); err != nil {
+	affected, err := s.updateJob(ctx, job)
+	if err != nil {
 		return err
 	}
+	if affected == 0 {
+		var persistedState string
+		if err := s.db.QueryRowContext(ctx, `SELECT state FROM jobs WHERE id = ?`, job.ID).Scan(&persistedState); err != nil {
+			return fmt.Errorf("read persisted job state: %w", err)
+		}
+		job.State = JobState(persistedState)
+		return nil
+	}
+	// A remove request can race with another worker that already loaded the
+	// job. UpdateJob's state guard keeps remove_pending authoritative; avoid
+	// emitting a misleading event when that guard wins.
 	return s.AppendEvent(ctx, job.ID, &prev, &next, message)
 }
 

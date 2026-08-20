@@ -74,10 +74,20 @@ func (o *Orchestrator) processSubmitJob(ctx context.Context, job *store.Job) err
 		return o.handleSubmitFailure(ctx, job, torbox.MarkRetryable(fmt.Errorf("torbox create returned empty response")))
 	}
 
-	job.RemoteID = ptr(strings.TrimSpace(resp.RemoteID))
-	job.QueuedID = ptr(strings.TrimSpace(resp.QueuedID))
+	remoteID := strings.TrimSpace(resp.RemoteID)
+	queuedID := strings.TrimSpace(resp.QueuedID)
+	// A duplicated generic ID is queue tracking, not active confirmation.
+	if remoteID != "" && queuedID != "" && remoteID == queuedID && !resp.ActiveIDExplicit {
+		remoteID = ""
+	}
+	job.RemoteID = ptr(remoteID)
+	job.QueuedID = ptr(queuedID)
 	job.QueueAuthID = ptr(strings.TrimSpace(resp.QueueAuthID))
-	job.RemoteHash = ptr(strings.TrimSpace(resp.RemoteHash))
+	remoteHash := strings.TrimSpace(resp.RemoteHash)
+	if remoteHash == "" && job.InfoHash != nil {
+		remoteHash = strings.TrimSpace(*job.InfoHash)
+	}
+	job.RemoteHash = ptr(remoteHash)
 	if strings.TrimSpace(resp.DisplayName) != "" {
 		job.DisplayName = strings.TrimSpace(resp.DisplayName)
 	}
@@ -89,7 +99,7 @@ func (o *Orchestrator) processSubmitJob(ctx context.Context, job *store.Job) err
 	nextRun := time.Now().UTC().Add(o.cfg.Workers.PollInterval)
 	job.NextRunAt = &nextRun
 	job.UpdatedAt = time.Now().UTC()
-	if job.RemoteID != nil {
+	if remoteID != "" {
 		o.log.Info("remote task created",
 			"job_id", job.ID,
 			"public_id", job.PublicID,
