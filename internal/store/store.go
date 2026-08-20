@@ -308,6 +308,28 @@ func (s *Store) UpdateJobState(ctx context.Context, job *Job, next JobState, mes
 	return s.AppendEvent(ctx, job.ID, &prev, &next, message)
 }
 
+func (s *Store) MarkJobRemovePending(ctx context.Context, id string) error {
+	now := s.now()
+	result, err := s.execWrite(ctx, `
+        UPDATE jobs
+        SET state = 'remove_pending',
+            delete_requested = 1,
+            next_run_at = ?,
+            error_message = NULL,
+            updated_at = ?
+        WHERE id = ? AND state NOT IN ('remove_pending', 'removed')
+    `, formatTime(now), formatTime(now), id)
+	if err != nil {
+		return fmt.Errorf("mark job remove pending: %w", err)
+	}
+	affected, _ := result.RowsAffected()
+	if affected == 0 {
+		return nil
+	}
+	to := StateRemovePending
+	return s.AppendEvent(ctx, id, nil, &to, "remove requested via Arr-compatible API")
+}
+
 func (s *Store) AppendEvent(ctx context.Context, jobID string, from, to *JobState, message string) error {
 	_, err := s.execWrite(ctx, `
         INSERT INTO job_events (job_id, from_state, to_state, message, created_at)

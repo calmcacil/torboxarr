@@ -141,7 +141,7 @@ func MarkRetryable(err error) error {
 
 func IsRetryable(err error) bool {
 	var retryable *RetryableError
-	return errors.As(err, &retryable)
+	return errors.As(err, &retryable) || IsRequestNotSent(err)
 }
 
 // ErrTorboxLogical indicates the TorBox API returned a structured error in its

@@ -65,32 +65,23 @@ func (o *Orchestrator) processRemoveJob(ctx context.Context, job *store.Job) err
 		"has_hash", removalHash(job) != "",
 	)
 
-	lookupRetry := false
-	if o.reconcileRemovalView(ctx, job, &active) {
-		lookupRetry = true
-	}
+	activeLookupRetry := o.reconcileRemovalView(ctx, job, &active)
 	// Active reconciliation can discover a queue ID that was not persisted on
 	// the job. Rebuild only the queued view so that fresh identity participates
 	// in the same pre-delete reconciliation phase.
 	_, queued = o.removalViews(job)
-	if o.reconcileRemovalView(ctx, job, &queued) {
-		lookupRetry = true
-	}
+	queuedLookupRetry := o.reconcileRemovalView(ctx, job, &queued)
 	if !active.applicable && !queued.applicable {
 		setRemovalOutcome(&job.Metadata.ActiveRemoval, store.UpstreamRemovalUnidentifiable, "no safe upstream identity")
 	}
-	if lookupRetry {
-		return o.scheduleRemovalRetry(ctx, job)
-	}
-
-	retryRemaining := false
-	if o.deleteRemovalView(ctx, job, &active) {
+	retryRemaining := activeLookupRetry || queuedLookupRetry
+	if !activeLookupRetry && o.deleteRemovalView(ctx, job, &active) {
 		retryRemaining = true
 	}
 	if err := o.store.UpdateJob(ctx, job); err != nil {
 		return fmt.Errorf("persist active upstream removal progress: %w", err)
 	}
-	if o.deleteRemovalView(ctx, job, &queued) {
+	if !queuedLookupRetry && o.deleteRemovalView(ctx, job, &queued) {
 		retryRemaining = true
 	}
 	if err := o.store.UpdateJob(ctx, job); err != nil {

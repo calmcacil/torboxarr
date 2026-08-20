@@ -669,6 +669,9 @@ func TestDeleteTaskCanceledBeforeLimiterDoesNotSend(t *testing.T) {
 	if !torbox.IsRequestNotSent(err) {
 		t.Fatalf("DeleteTask error = %v, want RequestNotSentError", err)
 	}
+	if !torbox.IsRetryable(err) {
+		t.Fatalf("DeleteTask error = %v, want retryable for non-removal callers", err)
+	}
 	if calls != 0 {
 		t.Fatalf("canceled limiter caused %d HTTP calls, want 0", calls)
 	}
@@ -684,6 +687,7 @@ func TestHTTPErrorClassification(t *testing.T) {
 	}{
 		{name: "structured 500", status: http.StatusInternalServerError, body: `{"success":false,"error":"DATABASE_ERROR"}`, logical: true},
 		{name: "plain 500", status: http.StatusInternalServerError, body: "outage", retryable: true},
+		{name: "request timeout", status: http.StatusRequestTimeout, body: "timeout", retryable: true},
 		{name: "structured 429", status: http.StatusTooManyRequests, body: `{"success":false,"error":"RATE_LIMIT"}`, retryable: true},
 	}
 	for _, test := range tests {

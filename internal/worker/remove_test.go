@@ -571,6 +571,52 @@ func TestProcessRemoveJob_PartialSuccessRetriesOnlyRemainingView(t *testing.T) {
 	}
 }
 
+func TestProcessRemoveJob_LookupFailureDoesNotBlockOtherView(t *testing.T) {
+	env := newRemoveTestEnv(t)
+	env.orch.cfg.UpstreamRemove = true
+	var activeDeletes, queuedDeletes int
+	env.mock.FindActiveTaskFn = func(context.Context, string, string, string, string) (*torbox.TaskStatus, error) {
+		return nil, errors.New("active lookup unavailable")
+	}
+	env.mock.FindQueuedTaskFn = func(_ context.Context, _, queuedID, _, _ string) (*torbox.TaskStatus, error) {
+		return &torbox.TaskStatus{QueuedID: queuedID}, nil
+	}
+	env.mock.DeleteTaskFn = func(context.Context, string, string) error {
+		activeDeletes++
+		return nil
+	}
+	env.mock.DeleteQueuedTaskFn = func(context.Context, string, string) error {
+		queuedDeletes++
+		return nil
+	}
+
+	job := env.insertRemovePendingJob(t, "lookup-partial", "401", store.SourceTypeTorrent)
+	job.QueuedID = ptr("402")
+	if err := env.store.UpdateJob(context.Background(), job); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.orch.processRemoveJob(context.Background(), job); err != nil {
+		t.Fatalf("processRemoveJob: %v", err)
+	}
+
+	if activeDeletes != 0 || queuedDeletes != 1 {
+		t.Fatalf("delete calls = active:%d queued:%d, want active 0 and queued 1", activeDeletes, queuedDeletes)
+	}
+	got, err := env.store.GetJobByID(context.Background(), job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != store.StateRemovePending {
+		t.Fatalf("state = %s, want remove_pending", got.State)
+	}
+	if got.Metadata.QueuedRemoval.Outcome != store.UpstreamRemovalDeleted {
+		t.Fatalf("queued outcome = %q, want deleted", got.Metadata.QueuedRemoval.Outcome)
+	}
+	if got.Metadata.ActiveRemoval.Attempts != 0 || got.Metadata.ActiveRemoval.Outcome != "" {
+		t.Fatalf("active progress = %#v, want unresolved with no delete attempt", got.Metadata.ActiveRemoval)
+	}
+}
+
 func TestProcessRemoveJob_AlreadyAbsentDoesNotWarn(t *testing.T) {
 	env := newRemoveTestEnv(t)
 	env.orch.cfg.UpstreamRemove = true

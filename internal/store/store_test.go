@@ -233,6 +233,36 @@ func TestUpdateJobState_RemoverCanRecordFailure(t *testing.T) {
 	}
 }
 
+func TestMarkJobRemovePendingPreservesWorkerData(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	job := makeJob("mark-remove-001", "pub-mark-remove-001", store.StateRemoteActive)
+	remoteID, completedPath := "701", "/completed/mark-remove-001"
+	job.RemoteID = &remoteID
+	job.CompletedPath = &completedPath
+	if err := st.CreateJob(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.MarkJobRemovePending(ctx, job.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := st.GetJobByID(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != store.StateRemovePending || !got.DeleteRequested {
+		t.Fatalf("state = %q delete_requested = %v, want remove_pending true", got.State, got.DeleteRequested)
+	}
+	if got.RemoteID == nil || *got.RemoteID != remoteID || got.CompletedPath == nil || *got.CompletedPath != completedPath {
+		t.Fatalf("worker cleanup data was not preserved: %#v", got)
+	}
+	if got.NextRunAt == nil {
+		t.Fatal("NextRunAt is nil, want removal due immediately")
+	}
+}
+
 // ─── FindActiveBySubmissionKey ───────────────────────────────────────────────
 
 func TestFindActiveBySubmissionKey(t *testing.T) {
