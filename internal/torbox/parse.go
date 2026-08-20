@@ -134,10 +134,14 @@ func parseTaskStatus(sourceType string, item map[string]any, active bool) *TaskS
 	// A queued item's generic id is its queue control ID. Explicit active ID
 	// fields still indicate that TorBox promoted the item between views.
 	remoteID := extractActiveID(sourceType, item, active)
+	queuedID := extractQueueReferenceID(item)
+	if !active {
+		queuedID = extractQueuedID(item)
+	}
 
 	return &TaskStatus{
 		RemoteID:         remoteID,
-		QueuedID:         extractQueueReferenceID(item),
+		QueuedID:         queuedID,
 		QueueAuthID:      extractQueueAuthID(sourceType, item),
 		Hash:             firstString(item, "hash"),
 		Name:             firstString(item, "name", "filename", "title"),

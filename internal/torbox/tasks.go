@@ -123,6 +123,9 @@ func (c *HTTPClient) GetTaskStatus(ctx context.Context, sourceType string, remot
 }
 
 func (c *HTTPClient) GetQueuedStatus(ctx context.Context, sourceType string, queuedID string) (*TaskStatus, error) {
+	if strings.TrimSpace(queuedID) == "" {
+		return nil, fmt.Errorf("queued id is required")
+	}
 	c.debug("fetching torbox queued status", "source_type", sourceType, "queued_id", queuedID)
 	return c.FindQueuedTask(ctx, sourceType, queuedID, "", "")
 }
@@ -183,7 +186,7 @@ func (c *HTTPClient) FindQueuedTask(ctx context.Context, sourceType string, queu
 			return status, nil
 		}
 	}
-	if initialErr != nil && !usedFullList {
+	if initialErr != nil {
 		return nil, initialErr
 	}
 	return nil, nil
@@ -254,7 +257,7 @@ func (c *HTTPClient) FindActiveTaskByIdentity(ctx context.Context, sourceType st
 			return status, nil
 		}
 	}
-	if initialErr != nil && !usedFullList {
+	if initialErr != nil {
 		return nil, initialErr
 	}
 	return nil, nil

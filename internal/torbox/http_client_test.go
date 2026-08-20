@@ -467,6 +467,50 @@ func TestFindQueuedTaskFallsBackToFullListAfterIDError(t *testing.T) {
 	}
 }
 
+func TestFindQueuedTaskPreservesFilteredErrorAfterInconclusiveFallback(t *testing.T) {
+	var calls int
+	client, _ := newTestHTTPClient(t, func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if r.URL.Query().Get("id") != "" {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"success":false,"error":"DATABASE_ERROR"}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(jsonEnvelope([]map[string]any{}))
+	})
+
+	status, err := client.FindQueuedTask(t.Context(), "torrent", "42", "", "expected-hash")
+	if status != nil || err == nil {
+		t.Fatalf("status = %#v, error = %v, want original filtered lookup error", status, err)
+	}
+	if calls != 2 {
+		t.Fatalf("request count = %d, want 2", calls)
+	}
+}
+
+func TestFindActiveTaskPreservesFilteredErrorAfterInconclusiveFallback(t *testing.T) {
+	var calls int
+	client, _ := newTestHTTPClient(t, func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if r.URL.Query().Get("id") != "" {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"success":false,"error":"DATABASE_ERROR"}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(jsonEnvelope([]map[string]any{}))
+	})
+
+	status, err := client.FindActiveTaskByIdentity(t.Context(), "torrent", "42", "queued-42", "", "expected-hash")
+	if status != nil || err == nil {
+		t.Fatalf("status = %#v, error = %v, want original filtered lookup error", status, err)
+	}
+	if calls != 2 {
+		t.Fatalf("request count = %d, want 2", calls)
+	}
+}
+
 func TestFindQueuedTaskUsesUsenetQueueTypeAndAuthID(t *testing.T) {
 	client, _ := newTestHTTPClient(t, func(w http.ResponseWriter, r *http.Request) {
 		if got := r.URL.Query().Get("type"); got != "usenet" {
