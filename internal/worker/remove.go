@@ -62,7 +62,6 @@ func (o *Orchestrator) processRemoveJob(ctx context.Context, job *store.Job) err
 		"source_type", job.SourceType,
 		"active_id", deref(job.RemoteID),
 		"queued_id", deref(job.QueuedID),
-		"queue_auth_id", deref(job.QueueAuthID),
 		"has_hash", removalHash(job) != "",
 	)
 
@@ -236,9 +235,13 @@ func (o *Orchestrator) reconcileRemovalView(ctx context.Context, job *store.Job,
 	}
 	if _, err := strconv.ParseInt(controlID, 10, 64); err != nil || strings.HasPrefix(controlID, "-") {
 		setRemovalOutcome(view.progress, store.UpstreamRemovalUnidentifiable, "control identity is not numeric")
+		o.log.Warn("upstream cleanup control identity is not numeric",
+			"job_id", job.ID, "public_id", job.PublicID, "source_type", job.SourceType, "upstream_view", view.name)
 		return false
 	}
 	view.controlIDValue = controlID
+	o.log.Info("upstream representation matched for cleanup",
+		"job_id", job.ID, "public_id", job.PublicID, "source_type", job.SourceType, "upstream_view", view.name, "control_id", controlID)
 	return false
 }
 
@@ -266,6 +269,11 @@ func (o *Orchestrator) deleteRemovalView(ctx context.Context, job *store.Job, vi
 		setRemovalOutcome(view.progress, store.UpstreamRemovalAbsent, "")
 		o.log.Info("upstream deletion found representation already absent", "job_id", job.ID, "public_id", job.PublicID, "source_type", job.SourceType, "upstream_view", view.name, "control_id", controlID)
 		return false
+	case torbox.IsRequestNotSent(err):
+		view.progress.LastError = "TorBox delete request was not sent"
+		o.log.Warn("upstream deletion was not sent; will retry without consuming an attempt",
+			"job_id", job.ID, "public_id", job.PublicID, "source_type", job.SourceType, "upstream_view", view.name, "control_id", controlID)
+		return true
 	case torbox.IsRetryable(err) || torbox.IsTorboxLogical(err):
 		view.progress.Attempts = attempt
 		view.progress.LastError = safeTorboxError(err)
@@ -294,8 +302,20 @@ func (o *Orchestrator) scheduleRemovalRetry(ctx context.Context, job *store.Job)
 	if err := o.store.UpdateJob(ctx, job); err != nil {
 		return fmt.Errorf("persist upstream removal retry: %w", err)
 	}
+	unresolved := make([]string, 0, 2)
+	if !job.Metadata.ActiveRemoval.Terminal() {
+		unresolved = append(unresolved, "active")
+	}
+	if !job.Metadata.QueuedRemoval.Terminal() {
+		unresolved = append(unresolved, "queued")
+	}
 	o.log.Warn("upstream cleanup incomplete; local payloads retained for retry",
-		"job_id", job.ID, "public_id", job.PublicID, "next_run_at", nextRun.Format(time.RFC3339Nano))
+		"job_id", job.ID,
+		"public_id", job.PublicID,
+		"source_type", job.SourceType,
+		"upstream_views", strings.Join(unresolved, ","),
+		"next_run_at", nextRun.Format(time.RFC3339Nano),
+	)
 	return nil
 }
 
@@ -358,10 +378,13 @@ func (o *Orchestrator) removeLocalPayloads(ctx context.Context, job *store.Job, 
 
 func legacyRemovalProgress(job *store.Job) {
 	legacy := job.Metadata.UpstreamDeleteAttempts
-	if legacy == 0 || job.Metadata.ActiveRemoval.Outcome != "" || job.Metadata.ActiveRemoval.Attempts != 0 {
+	if legacy == 0 {
 		return
 	}
 	job.Metadata.UpstreamDeleteAttempts = 0
+	if job.Metadata.ActiveRemoval.Outcome != "" || job.Metadata.ActiveRemoval.Attempts != 0 {
+		return
+	}
 	job.Metadata.ActiveRemoval.Attempts = legacy
 	if legacy >= maxUpstreamDeleteAttempts {
 		setRemovalOutcome(&job.Metadata.ActiveRemoval, store.UpstreamRemovalExhausted, "legacy upstream delete attempt budget exhausted")

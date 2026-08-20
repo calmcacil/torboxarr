@@ -83,7 +83,6 @@ func (o *Orchestrator) processQueuedPollJob(ctx context.Context, job *store.Job)
 		"job_id", job.ID,
 		"public_id", job.PublicID,
 		"queued_id", deref(job.QueuedID),
-		"queue_auth_id", deref(job.QueueAuthID),
 		"remote_hash", deref(job.RemoteHash),
 	)
 	queuedStatus, err := o.torbox.GetQueuedStatus(ctx, string(job.SourceType), deref(job.QueuedID))
@@ -120,7 +119,6 @@ func (o *Orchestrator) processQueuedPollJob(ctx context.Context, job *store.Job)
 			"public_id", job.PublicID,
 			"queued_id", deref(job.QueuedID),
 			"remote_id", deref(job.RemoteID),
-			"queue_auth_id", deref(job.QueueAuthID),
 		)
 		if err := o.store.UpdateJobState(ctx, job, store.StateRemoteActive, "queued task promoted to active"); err != nil {
 			return err
@@ -146,7 +144,6 @@ func (o *Orchestrator) processQueuedPollJob(ctx context.Context, job *store.Job)
 		"public_id", job.PublicID,
 		"queued_id", deref(job.QueuedID),
 		"queue_state", queuedStatus.State,
-		"queue_auth_id", deref(job.QueueAuthID),
 		"next_run_at", nextRun.Format(time.RFC3339Nano),
 	)
 	return o.store.UpdateJob(ctx, job)
@@ -181,7 +178,6 @@ func (o *Orchestrator) tryRecoverActiveStatus(ctx context.Context, job *store.Jo
 			"job_id", job.ID,
 			"public_id", job.PublicID,
 			"queued_id", deref(job.QueuedID),
-			"queue_auth_id", deref(job.QueueAuthID),
 			"has_remote_hash", job.RemoteHash != nil,
 			"next_run_at", nextRun.Format(time.RFC3339Nano),
 		)

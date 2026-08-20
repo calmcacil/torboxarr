@@ -116,7 +116,6 @@ func (o *Orchestrator) processSubmitJob(ctx context.Context, job *store.Job) err
 		"job_id", job.ID,
 		"public_id", job.PublicID,
 		"queued_id", deref(job.QueuedID),
-		"queue_auth_id", deref(job.QueueAuthID),
 		"remote_hash", deref(job.RemoteHash),
 		"display_name", job.DisplayName,
 		"next_run_at", nextRun.Format(time.RFC3339Nano),

@@ -637,3 +637,47 @@ func TestProcessRemoveJob_DefinitiveRejectionPersistsWarning(t *testing.T) {
 		t.Fatalf("active outcome = %q, want rejected", got.Metadata.ActiveRemoval.Outcome)
 	}
 }
+
+func TestProcessRemoveJob_RequestNotSentDoesNotConsumeAttempt(t *testing.T) {
+	env := newRemoveTestEnv(t)
+	env.orch.cfg.UpstreamRemove = true
+	env.mock.DeleteTaskFn = func(context.Context, string, string) error {
+		return &torbox.RequestNotSentError{Err: context.Canceled}
+	}
+
+	job := env.insertRemovePendingJob(t, "not-sent-view", "601", store.SourceTypeTorrent)
+	if err := env.orch.processRemoveJob(context.Background(), job); err != nil {
+		t.Fatalf("processRemoveJob: %v", err)
+	}
+	got, err := env.store.GetJobByID(context.Background(), job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != store.StateRemovePending {
+		t.Fatalf("state = %s, want remove_pending", got.State)
+	}
+	if got.Metadata.ActiveRemoval.Attempts != 0 {
+		t.Fatalf("active attempts = %d, want 0", got.Metadata.ActiveRemoval.Attempts)
+	}
+	if _, err := os.Stat(filepath.Join(env.dir, "completed", job.ID, "file.mkv")); err != nil {
+		t.Fatalf("local payload should remain: %v", err)
+	}
+}
+
+func TestLegacyRemovalProgressClearsLegacyCounter(t *testing.T) {
+	job := &store.Job{Metadata: store.SubmissionMetadata{
+		UpstreamDeleteAttempts: 4,
+		ActiveRemoval: store.UpstreamRemovalProgress{
+			Attempts: 2,
+		},
+	}}
+
+	legacyRemovalProgress(job)
+
+	if job.Metadata.UpstreamDeleteAttempts != 0 {
+		t.Fatalf("legacy attempts = %d, want 0", job.Metadata.UpstreamDeleteAttempts)
+	}
+	if job.Metadata.ActiveRemoval.Attempts != 2 {
+		t.Fatalf("active attempts = %d, want existing value 2", job.Metadata.ActiveRemoval.Attempts)
+	}
+}

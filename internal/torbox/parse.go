@@ -135,10 +135,9 @@ func parseTaskStatus(sourceType string, item map[string]any, active bool) *TaskS
 	failed := (stateFailed || labelFailed) && !downloadReady
 	inactive := label == "inactive" || firstBool(item, "inactive")
 
-	remoteID := ""
-	if active {
-		remoteID = extractActiveID(sourceType, item, true)
-	}
+	// A queued item's generic id is its queue control ID. Explicit active ID
+	// fields still indicate that TorBox promoted the item between views.
+	remoteID := extractActiveID(sourceType, item, active)
 
 	return &TaskStatus{
 		RemoteID:         remoteID,

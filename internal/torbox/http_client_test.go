@@ -2,6 +2,7 @@ package torbox_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -648,6 +649,31 @@ func TestDeleteOperationsRejectInvalidIDsWithoutHTTP(t *testing.T) {
 	}
 }
 
+func TestDeleteTaskCanceledBeforeLimiterDoesNotSend(t *testing.T) {
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		calls++
+	}))
+	t.Cleanup(server.Close)
+
+	bucket := torbox.NewTokenBucket(1, time.Hour)
+	t.Cleanup(bucket.Stop)
+	if err := bucket.Wait(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	client := torbox.NewHTTPClient(nil, server.URL, "test-token", "test-agent", 10*time.Second, nil, bucket, nil)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	err := client.DeleteTask(ctx, "torrent", "42")
+	if !torbox.IsRequestNotSent(err) {
+		t.Fatalf("DeleteTask error = %v, want RequestNotSentError", err)
+	}
+	if calls != 0 {
+		t.Fatalf("canceled limiter caused %d HTTP calls, want 0", calls)
+	}
+}
+
 func TestHTTPErrorClassification(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -680,16 +706,20 @@ func TestHTTPErrorClassification(t *testing.T) {
 	}
 }
 
-func TestDeleteTaskNotFoundIsAbsent(t *testing.T) {
+func TestDeleteTaskGenericNotFoundIsNotAbsence(t *testing.T) {
 	client, _ := newTestHTTPClient(t, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
-		_, _ = w.Write([]byte("missing"))
+		_, _ = w.Write([]byte("endpoint not found"))
 	})
-	if err := client.DeleteTask(t.Context(), "torrent", "1"); !torbox.IsTorboxAbsent(err) {
-		t.Fatalf("DeleteTask error = %v, want ErrTorboxAbsent", err)
+	if err := client.DeleteTask(t.Context(), "torrent", "1"); err == nil || torbox.IsTorboxAbsent(err) {
+		t.Fatalf("DeleteTask error = %v, want non-absence error", err)
+	} else if !torbox.IsRetryable(err) {
+		t.Fatalf("DeleteTask error = %v, want retryable uncertainty", err)
 	}
-	if err := client.DeleteQueuedTask(t.Context(), "torrent", "1"); !torbox.IsTorboxAbsent(err) {
-		t.Fatalf("DeleteQueuedTask error = %v, want ErrTorboxAbsent", err)
+	if err := client.DeleteQueuedTask(t.Context(), "torrent", "1"); err == nil || torbox.IsTorboxAbsent(err) {
+		t.Fatalf("DeleteQueuedTask error = %v, want non-absence error", err)
+	} else if !torbox.IsRetryable(err) {
+		t.Fatalf("DeleteQueuedTask error = %v, want retryable uncertainty", err)
 	}
 }
 
@@ -747,6 +777,40 @@ func TestFindQueuedTaskRefreshesStaleID(t *testing.T) {
 	}
 	if calls != 2 {
 		t.Fatalf("lookup calls = %d, want stale-id lookup plus full-list fallback", calls)
+	}
+}
+
+func TestGetQueuedStatusPreservesExplicitActiveID(t *testing.T) {
+	client, _ := newTestHTTPClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(jsonEnvelope(map[string]any{
+			"id":         42,
+			"torrent_id": 99,
+			"hash":       "exact-hash",
+		}))
+	})
+
+	status, err := client.GetQueuedStatus(t.Context(), "torrent", "42")
+	if err != nil {
+		t.Fatalf("GetQueuedStatus: %v", err)
+	}
+	if status == nil || status.QueuedID != "42" || status.RemoteID != "99" {
+		t.Fatalf("status = %#v, want queued id 42 and explicit active id 99", status)
+	}
+}
+
+func TestGetQueuedStatusDoesNotTreatGenericIDAsActive(t *testing.T) {
+	client, _ := newTestHTTPClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(jsonEnvelope(map[string]any{"id": 42}))
+	})
+
+	status, err := client.GetQueuedStatus(t.Context(), "torrent", "42")
+	if err != nil {
+		t.Fatalf("GetQueuedStatus: %v", err)
+	}
+	if status == nil || status.QueuedID != "42" || status.RemoteID != "" {
+		t.Fatalf("status = %#v, want queue-only id 42", status)
 	}
 }
 

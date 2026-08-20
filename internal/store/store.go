@@ -275,6 +275,31 @@ func (s *Store) UpdateJobState(ctx context.Context, job *Job, next JobState, mes
 			return fmt.Errorf("read persisted job state: %w", err)
 		}
 		job.State = JobState(persistedState)
+		if job.State == StateRemovePending {
+			// A worker may finish an external create or local promotion after a
+			// removal request wins. Preserve only cleanup-critical discoveries;
+			// never let the stale worker revive or otherwise rewrite the job.
+			if _, err := s.execWrite(ctx, `
+                UPDATE jobs
+                SET remote_id = COALESCE(remote_id, NULLIF(?, '')),
+                    queued_id = COALESCE(queued_id, NULLIF(?, '')),
+                    queue_auth_id = COALESCE(queue_auth_id, NULLIF(?, '')),
+                    remote_hash = COALESCE(remote_hash, NULLIF(?, '')),
+                    completed_path = COALESCE(completed_path, NULLIF(?, '')),
+                    updated_at = ?
+                WHERE id = ? AND state = 'remove_pending'
+            `,
+				nullableString(job.RemoteID),
+				nullableString(job.QueuedID),
+				nullableString(job.QueueAuthID),
+				nullableString(job.RemoteHash),
+				nullableString(job.CompletedPath),
+				formatTime(s.now()),
+				job.ID,
+			); err != nil {
+				return fmt.Errorf("merge stale worker cleanup data: %w", err)
+			}
+		}
 		return nil
 	}
 	// A remove request can race with another worker that already loaded the

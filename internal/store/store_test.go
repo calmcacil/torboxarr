@@ -170,6 +170,47 @@ func TestUpdateJobState_RemoveRequestWinsOverStaleWorker(t *testing.T) {
 	}
 }
 
+func TestUpdateJobState_RemoveRequestRetainsStaleWorkerCleanupData(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	job := makeJob("remove-merge-001", "pub-remove-merge-001", store.StateSubmitPending)
+	if err := st.CreateJob(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	stale := *job
+
+	job.DeleteRequested = true
+	if err := st.UpdateJobState(ctx, job, store.StateRemovePending, "remove requested"); err != nil {
+		t.Fatal(err)
+	}
+	remoteID, queuedID := "101", "202"
+	queueAuthID, remoteHash := "secret-auth", "exact-hash"
+	completedPath := "/completed/remove-merge-001"
+	stale.RemoteID = &remoteID
+	stale.QueuedID = &queuedID
+	stale.QueueAuthID = &queueAuthID
+	stale.RemoteHash = &remoteHash
+	stale.CompletedPath = &completedPath
+	if err := st.UpdateJobState(ctx, &stale, store.StateCompleted, "stale worker completed"); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := st.GetJobByID(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != store.StateRemovePending {
+		t.Fatalf("State = %q, want %q", got.State, store.StateRemovePending)
+	}
+	if got.RemoteID == nil || *got.RemoteID != "101" || got.QueuedID == nil || *got.QueuedID != "202" || got.QueueAuthID == nil || *got.QueueAuthID != "secret-auth" || got.RemoteHash == nil || *got.RemoteHash != "exact-hash" {
+		t.Fatalf("upstream identities were not retained: %#v", got)
+	}
+	if got.CompletedPath == nil || *got.CompletedPath != completedPath {
+		t.Fatalf("CompletedPath = %v, want promoted path", got.CompletedPath)
+	}
+}
+
 func TestUpdateJobState_RemoverCanRecordFailure(t *testing.T) {
 	st := newTestStore(t)
 	ctx := context.Background()

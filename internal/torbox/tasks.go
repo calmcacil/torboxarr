@@ -143,9 +143,6 @@ func (c *HTTPClient) FindQueuedTask(ctx context.Context, sourceType string, queu
 	usedFullList := false
 	if err != nil {
 		if strings.TrimSpace(queuedID) == "" {
-			if isAbsentLookupError(err) {
-				return nil, nil
-			}
 			return nil, err
 		}
 		if err := c.wait(ctx, c.pollLimiter); err != nil {
@@ -154,9 +151,6 @@ func (c *HTTPClient) FindQueuedTask(ctx context.Context, sourceType string, queu
 		items, err = c.getQueuedItems(ctx, sourceType, "")
 		usedFullList = true
 		if err != nil {
-			if isAbsentLookupError(err) {
-				return nil, nil
-			}
 			return nil, err
 		}
 	}
@@ -168,7 +162,6 @@ func (c *HTTPClient) FindQueuedTask(ctx context.Context, sourceType string, queu
 		c.debug("matched queued torbox task",
 			"source_type", sourceType,
 			"queued_id", status.QueuedID,
-			"queue_auth_id", status.QueueAuthID,
 			"has_hash", status.Hash != "",
 		)
 		return status, nil
@@ -180,9 +173,6 @@ func (c *HTTPClient) FindQueuedTask(ctx context.Context, sourceType string, queu
 		items, err = c.getQueuedItems(ctx, sourceType, "")
 		usedFullList = true
 		if err != nil {
-			if isAbsentLookupError(err) {
-				return nil, nil
-			}
 			return nil, err
 		}
 		status, err = findTaskStatus(sourceType, items, "", queuedID, queueAuthID, remoteHash, true)
@@ -193,7 +183,7 @@ func (c *HTTPClient) FindQueuedTask(ctx context.Context, sourceType string, queu
 			return status, nil
 		}
 	}
-	if initialErr != nil && !isAbsentLookupError(initialErr) {
+	if initialErr != nil && !usedFullList {
 		return nil, initialErr
 	}
 	return nil, nil
@@ -208,7 +198,6 @@ func (c *HTTPClient) FindActiveTaskByIdentity(ctx context.Context, sourceType st
 	c.debug("finding active torbox task",
 		"source_type", sourceType,
 		"remote_id", remoteID,
-		"queue_auth_id", queueAuthID,
 		"has_hash", strings.TrimSpace(remoteHash) != "",
 	)
 	if err := c.wait(ctx, c.pollLimiter); err != nil {
@@ -219,9 +208,6 @@ func (c *HTTPClient) FindActiveTaskByIdentity(ctx context.Context, sourceType st
 	usedFullList := false
 	if err != nil {
 		if strings.TrimSpace(remoteID) == "" || (strings.TrimSpace(queuedID) == "" && strings.TrimSpace(queueAuthID) == "" && strings.TrimSpace(remoteHash) == "") {
-			if isAbsentLookupError(err) {
-				return nil, nil
-			}
 			return nil, err
 		}
 		if err := c.wait(ctx, c.pollLimiter); err != nil {
@@ -230,9 +216,6 @@ func (c *HTTPClient) FindActiveTaskByIdentity(ctx context.Context, sourceType st
 		items, err = c.getRemoteItems(ctx, sourceType, "")
 		usedFullList = true
 		if err != nil {
-			if isAbsentLookupError(err) {
-				return nil, nil
-			}
 			return nil, err
 		}
 	}
@@ -244,7 +227,6 @@ func (c *HTTPClient) FindActiveTaskByIdentity(ctx context.Context, sourceType st
 		c.debug("matched active torbox task",
 			"source_type", sourceType,
 			"remote_id", status.RemoteID,
-			"queue_auth_id", status.QueueAuthID,
 			"state", status.State,
 			"label", status.Label,
 			"download_ready", status.DownloadReady,
@@ -262,9 +244,6 @@ func (c *HTTPClient) FindActiveTaskByIdentity(ctx context.Context, sourceType st
 		items, err = c.getRemoteItems(ctx, sourceType, "")
 		usedFullList = true
 		if err != nil {
-			if isAbsentLookupError(err) {
-				return nil, nil
-			}
 			return nil, err
 		}
 		status, err = findTaskStatus(sourceType, items, remoteID, queuedID, queueAuthID, remoteHash, false)
@@ -275,14 +254,10 @@ func (c *HTTPClient) FindActiveTaskByIdentity(ctx context.Context, sourceType st
 			return status, nil
 		}
 	}
-	if initialErr != nil && !isAbsentLookupError(initialErr) {
+	if initialErr != nil && !usedFullList {
 		return nil, initialErr
 	}
 	return nil, nil
-}
-
-func isAbsentLookupError(err error) bool {
-	return IsHTTPStatus(err, http.StatusNotFound) || IsHTTPStatus(err, http.StatusGone)
 }
 
 func findTaskStatus(sourceType string, items []map[string]any, remoteID, queuedID, queueAuthID, remoteHash string, queued bool) (*TaskStatus, error) {
@@ -363,9 +338,6 @@ func (c *HTTPClient) DeleteTask(ctx context.Context, sourceType string, remoteID
 		body := fmt.Sprintf(`{"operation":"delete","torrent_id":%d}`, id)
 		_, err := c.do(ctx, http.MethodPost, "/api/torrents/controltorrent", strings.NewReader(body), "application/json", true)
 		if err != nil {
-			if IsHTTPStatus(err, http.StatusNotFound) || IsHTTPStatus(err, http.StatusGone) {
-				return &ErrTorboxAbsent{Err: err}
-			}
 			return fmt.Errorf("delete torrent: %w", err)
 		}
 		return nil
@@ -376,9 +348,6 @@ func (c *HTTPClient) DeleteTask(ctx context.Context, sourceType string, remoteID
 		body := fmt.Sprintf(`{"operation":"delete","usenet_id":%d}`, id)
 		_, err := c.do(ctx, http.MethodPost, "/api/usenet/controlusenetdownload", strings.NewReader(body), "application/json", true)
 		if err != nil {
-			if IsHTTPStatus(err, http.StatusNotFound) || IsHTTPStatus(err, http.StatusGone) {
-				return &ErrTorboxAbsent{Err: err}
-			}
 			return fmt.Errorf("delete usenet: %w", err)
 		}
 		return nil
@@ -400,9 +369,6 @@ func (c *HTTPClient) DeleteQueuedTask(ctx context.Context, sourceType string, qu
 		return err
 	}
 	if _, err := c.do(ctx, http.MethodPost, "/api/queued/controlqueued", strings.NewReader(body), "application/json", true); err != nil {
-		if IsHTTPStatus(err, http.StatusNotFound) || IsHTTPStatus(err, http.StatusGone) {
-			return &ErrTorboxAbsent{Err: err}
-		}
 		return fmt.Errorf("delete queued task: %w", err)
 	}
 	return nil

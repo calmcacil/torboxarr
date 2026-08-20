@@ -87,6 +87,25 @@ type RetryableError struct {
 	Err error
 }
 
+// RequestNotSentError reports a failure before an HTTP request was issued.
+// Callers may retry it, but it must not consume an uncertain-request budget.
+type RequestNotSentError struct {
+	Err error
+}
+
+func (e *RequestNotSentError) Error() string {
+	return e.Err.Error()
+}
+
+func (e *RequestNotSentError) Unwrap() error {
+	return e.Err
+}
+
+func IsRequestNotSent(err error) bool {
+	var notSent *RequestNotSentError
+	return errors.As(err, &notSent)
+}
+
 type HTTPStatusError struct {
 	StatusCode int
 	Message    string
