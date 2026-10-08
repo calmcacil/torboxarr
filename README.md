@@ -40,7 +40,7 @@ State is stored in a local SQLite database. The schema is managed with [goose](h
 
 ### Requirements
 
-- Go 1.26+ (for building from source)
+- Go 1.27.1+ (for building from source)
 - A TorBox account with an API token
 - Sonarr, Radarr, or a similar *arr application
 
