@@ -909,6 +909,161 @@ func TestProcessDownloadJob_Refreshes404Link(t *testing.T) {
 	}
 }
 
+func TestProcessDownloadJob_Refreshes403Link(t *testing.T) {
+	env := newWorkerEnv(t)
+	ctx := context.Background()
+
+	const content = "refreshed payload"
+
+	staleServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer staleServer.Close()
+
+	freshServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(content)))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(content))
+	}))
+	defer freshServer.Close()
+
+	var getLinksCalls atomic.Int32
+	env.mock.GetDownloadLinksFn = func(ctx context.Context, sourceType, remoteID string) ([]torbox.DownloadAsset, error) {
+		call := getLinksCalls.Add(1)
+		url := staleServer.URL + "/file.bin"
+		if call > 1 {
+			url = freshServer.URL + "/file.bin"
+		}
+		return []torbox.DownloadAsset{{
+			FileID:       "file-1",
+			URL:          url,
+			RelativePath: "file.bin",
+			Size:         int64(len(content)),
+		}}, nil
+	}
+
+	job := makeWorkerJob("download-refresh-001", "pub-download-refresh-001", store.StateLocalDownloadPending, store.SourceTypeTorrent)
+	job.RemoteID = strPtr("remote-download-refresh-001")
+	past := time.Now().UTC().Add(-1 * time.Minute)
+	job.NextRunAt = &past
+	if err := env.store.CreateJob(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := workerConfig(env.tmpDir)
+	cfg.Workers.DownloadInterval = 100 * time.Millisecond
+	cfg.Workers.FinalizeInterval = time.Hour
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	downloader := files.NewRangeDownloader(logger, 30*time.Second)
+	orch := worker.NewOrchestrator(cfg, logger, env.store, env.layout, downloader, env.mock)
+
+	startCtx, cancel := context.WithCancel(ctx)
+	if err := orch.Start(startCtx); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "job download-refresh-001 reaches StateLocalVerify", 5*time.Second, func() bool {
+		got, _ := env.store.GetJobByID(ctx, "download-refresh-001")
+		return got != nil && got.State == store.StateLocalVerify
+	})
+	cancel()
+	orch.Wait()
+
+	if got := getLinksCalls.Load(); got < 2 {
+		t.Fatalf("GetDownloadLinks called %d times, want at least 2", got)
+	}
+
+	parts, err := env.store.ListTransferParts(ctx, "download-refresh-001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(parts) != 1 {
+		t.Fatalf("len(parts) = %d, want 1", len(parts))
+	}
+	if parts[0].SourceURL != freshServer.URL+"/file.bin" {
+		t.Fatalf("SourceURL = %q, want refreshed URL", parts[0].SourceURL)
+	}
+
+	got, err := env.store.GetJobByID(ctx, "download-refresh-001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.StagingPath == nil {
+		t.Fatal("expected staging path to be set")
+	}
+	data, err := os.ReadFile(filepath.Join(*got.StagingPath, "file.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != content {
+		t.Fatalf("downloaded content = %q, want %q", string(data), content)
+	}
+}
+
+func TestProcessDownloadJob_FailsWhen400LinkCannotBeRefreshed(t *testing.T) {
+	env := newWorkerEnv(t)
+	ctx := context.Background()
+
+	staleServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	defer staleServer.Close()
+
+	var getLinksCalls atomic.Int32
+	env.mock.GetDownloadLinksFn = func(ctx context.Context, sourceType, remoteID string) ([]torbox.DownloadAsset, error) {
+		getLinksCalls.Add(1)
+		return []torbox.DownloadAsset{{
+			FileID:       "file-1",
+			URL:          staleServer.URL + "/file.bin",
+			RelativePath: "file.bin",
+			Size:         16,
+		}}, nil
+	}
+
+	job := makeWorkerJob("download-400-fail-001", "pub-download-400-fail-001", store.StateLocalDownloadPending, store.SourceTypeTorrent)
+	job.RemoteID = strPtr("remote-download-400-fail-001")
+	past := time.Now().UTC().Add(-1 * time.Minute)
+	job.NextRunAt = &past
+	if err := env.store.CreateJob(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := workerConfig(env.tmpDir)
+	cfg.Workers.DownloadInterval = 100 * time.Millisecond
+	cfg.Workers.FinalizeInterval = time.Hour
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	downloader := files.NewRangeDownloader(logger, 30*time.Second)
+	orch := worker.NewOrchestrator(cfg, logger, env.store, env.layout, downloader, env.mock)
+
+	startCtx, cancel := context.WithCancel(ctx)
+	if err := orch.Start(startCtx); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "job download-400-fail-001 reaches StateFailed", 5*time.Second, func() bool {
+		got, _ := env.store.GetJobByID(ctx, "download-400-fail-001")
+		return got != nil && got.State == store.StateFailed
+	})
+	cancel()
+	orch.Wait()
+
+	if got := getLinksCalls.Load(); got != 2 {
+		t.Fatalf("GetDownloadLinks called %d times, want 2", got)
+	}
+
+	got, err := env.store.GetJobByID(ctx, "download-400-fail-001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.NextRunAt != nil {
+		t.Fatalf("NextRunAt = %v, want nil", got.NextRunAt)
+	}
+	if got.ErrorMessage == nil || *got.ErrorMessage != "download part returned HTTP 400 and no fresh link was available" {
+		t.Fatalf("ErrorMessage = %v, want terminal refresh error", got.ErrorMessage)
+	}
+	if got.RetryCount != 0 {
+		t.Fatalf("RetryCount = %d, want 0", got.RetryCount)
+	}
+}
+
 func TestProcessDownloadJob_Refreshes500Link(t *testing.T) {
 	env := newWorkerEnv(t)
 	ctx := context.Background()
@@ -1060,7 +1215,7 @@ func TestProcessDownloadJob_FailsAfterThree5xxResponses(t *testing.T) {
 	}
 }
 
-func TestProcessDownloadJob_DoesNotRefresh403Link(t *testing.T) {
+func TestProcessDownloadJob_FailsAfterRepeated403(t *testing.T) {
 	env := newWorkerEnv(t)
 	ctx := context.Background()
 
@@ -1099,15 +1254,15 @@ func TestProcessDownloadJob_DoesNotRefresh403Link(t *testing.T) {
 	if err := orch.Start(startCtx); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, "job download-no-refresh-001 reaches StateLocalDownloading", 5*time.Second, func() bool {
+	waitFor(t, "job download-no-refresh-001 reaches StateFailed", 5*time.Second, func() bool {
 		got, _ := env.store.GetJobByID(ctx, "download-no-refresh-001")
-		return got != nil && got.State == store.StateLocalDownloading
+		return got != nil && got.State == store.StateFailed
 	})
 	cancel()
 	orch.Wait()
 
-	if got := calls.Load(); got != 1 {
-		t.Fatalf("GetDownloadLinks called %d times, want 1", got)
+	if got := calls.Load(); got != 4 {
+		t.Fatalf("GetDownloadLinks called %d times, want 4", got)
 	}
 
 	parts, err := env.store.ListTransferParts(ctx, "download-no-refresh-001")
@@ -1121,8 +1276,11 @@ func TestProcessDownloadJob_DoesNotRefresh403Link(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.RetryCount != 0 {
-		t.Fatalf("RetryCount = %d, want 0", got.RetryCount)
+	if got.RetryCount != 3 {
+		t.Fatalf("RetryCount = %d, want 3", got.RetryCount)
+	}
+	if got.NextRunAt != nil || got.ClaimedBy != nil {
+		t.Fatal("terminal download must stop retries and release its claim")
 	}
 }
 
