@@ -1061,6 +1061,7 @@ func TestHTTPErrorClassification(t *testing.T) {
 	}{
 		{name: "structured 500", status: http.StatusInternalServerError, body: `{"success":false,"error":"DATABASE_ERROR"}`, logical: true},
 		{name: "plain 500", status: http.StatusInternalServerError, body: "outage", retryable: true},
+		{name: "structured 521", status: torbox.StatusTorboxOriginDown, body: `{"success":false,"error":"ORIGIN_DOWN"}`, retryable: true},
 		{name: "request timeout", status: http.StatusRequestTimeout, body: "timeout", retryable: true},
 		{name: "structured 429", status: http.StatusTooManyRequests, body: `{"success":false,"error":"RATE_LIMIT"}`, retryable: true},
 	}

@@ -90,6 +90,10 @@ type SubmissionMetadata struct {
 	// exists (or a sustained TorBox outage) doesn't poll forever.
 	PollAttempts int `json:"poll_attempts,omitempty"`
 
+	// Torbox521Attempts counts create attempts made under the bounded HTTP 521
+	// outage policy. It is separate from generic retry and poll accounting.
+	Torbox521Attempts int `json:"torbox_521_attempts,omitempty"`
+
 	QueuedAt                *time.Time `json:"queued_at,omitempty"`
 	ForceStartLastAttemptAt *time.Time `json:"force_start_last_attempt_at,omitempty"`
 	ForceStartAcceptedAt    *time.Time `json:"force_start_accepted_at,omitempty"`

@@ -124,6 +124,9 @@ func classifyEnvelopeError(env *apiEnvelope, status int) error {
 	if code != "" || env.Detail != "" {
 		message = fmt.Sprintf("torbox api error: %s (%s)", code, env.Detail)
 	}
+	if status == StatusTorboxOriginDown {
+		return MarkRetryable(&HTTPStatusError{StatusCode: status, Message: fmt.Sprintf("torbox status %d: %s", status, message)})
+	}
 	switch code {
 	case "ITEM_NOT_FOUND":
 		return &ErrTorboxAbsent{Err: errors.New(message)}

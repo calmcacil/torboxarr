@@ -476,6 +476,28 @@ func (s *Store) ListRemoteFailedWithQueueTracking(ctx context.Context) ([]*Job, 
 	return scanJobs(rows)
 }
 
+// ListRemoteFailed521 returns historical submission failures that were caused
+// by an HTTP 521 response and may still have a usable source for recovery.
+func (s *Store) ListRemoteFailed521(ctx context.Context) ([]*Job, error) {
+	rows, err := s.db.QueryContext(ctx, `
+        SELECT `+jobColumns+`
+        FROM jobs
+        WHERE state = 'remote_failed'
+          AND delete_requested = 0
+          AND error_message IS NOT NULL
+          AND (
+              error_message LIKE '%status 521%'
+              OR error_message LIKE '%HTTP 521%'
+          )
+        ORDER BY updated_at ASC
+    `)
+	if err != nil {
+		return nil, fmt.Errorf("list historical 521 failures: %w", err)
+	}
+	defer rows.Close()
+	return scanJobs(rows)
+}
+
 func (s *Store) ListVisibleClientJobs(ctx context.Context, clientKind ClientKind, category string, limit int) ([]*Job, error) {
 	query := `
         SELECT ` + jobColumns + ` FROM jobs

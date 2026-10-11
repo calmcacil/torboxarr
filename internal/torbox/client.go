@@ -114,6 +114,8 @@ type HTTPStatusError struct {
 	Message    string
 }
 
+const StatusTorboxOriginDown = 521
+
 func (e *HTTPStatusError) Error() string {
 	return e.Message
 }

@@ -107,6 +107,9 @@ func (o *Orchestrator) reconcileStartup(ctx context.Context) error {
 	if err := o.recoverFailedQueuedJobs(ctx); err != nil {
 		return fmt.Errorf("recover failed queued jobs: %w", err)
 	}
+	if err := o.recoverHistorical521Failures(ctx); err != nil {
+		return fmt.Errorf("recover historical 521 failures: %w", err)
+	}
 
 	jobs, err := o.store.ListOpenJobs(ctx)
 	if err != nil {
@@ -166,6 +169,40 @@ func (o *Orchestrator) reconcileStartup(ctx context.Context) error {
 	}
 	_, err = o.layout.RemoveOrphanStagingDirs(validIDs)
 	return err
+}
+
+// recoverHistorical521Failures gives jobs failed by an older build one
+// bounded recovery sequence. The recorded failure counts as the first create
+// attempt, so the first reopened attempt uses the 15-minute stage.
+func (o *Orchestrator) recoverHistorical521Failures(ctx context.Context) error {
+	jobs, err := o.store.ListRemoteFailed521(ctx)
+	if err != nil {
+		return err
+	}
+	for _, job := range jobs {
+		if job.DeleteRequested || deref(job.SourceURI) == "" || job.Metadata.Torbox521Attempts >= maxTorbox521Attempts {
+			continue
+		}
+		if job.Metadata.Torbox521Attempts == 0 {
+			job.Metadata.Torbox521Attempts = 1
+		}
+		nextRun := time.Now().UTC().Add(torbox521RetryDelays[0])
+		job.NextRunAt = &nextRun
+		job.UpdatedAt = time.Now().UTC()
+		message := fmt.Sprintf("historical HTTP 521 failure scheduled for retry %d of %d", job.Metadata.Torbox521Attempts+1, maxTorbox521Attempts)
+		ok, updateErr := o.store.UpdateJobStateIfCurrent(ctx, job, store.StateRemoteFailed, store.StateSubmitRetry, message)
+		if updateErr != nil {
+			return updateErr
+		}
+		if ok {
+			o.log.Info("scheduled historical HTTP 521 failure for retry",
+				"job_id", job.ID,
+				"public_id", job.PublicID,
+				"next_run_at", nextRun.Format(time.RFC3339Nano),
+			)
+		}
+	}
+	return nil
 }
 
 func (o *Orchestrator) recoverFailedQueuedJobs(ctx context.Context) error {
