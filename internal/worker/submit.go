@@ -158,8 +158,8 @@ func (o *Orchestrator) handleSubmitFailure(ctx context.Context, job *store.Job, 
 		return updateErr
 	}
 	job.NextRunAt = nil
-	o.log.Error("submit failed permanently", "job_id", job.ID, "public_id", job.PublicID, "error", message)
-	_, updateErr := o.store.UpdateJobStateIfCurrent(ctx, job, expectedState, store.StateRemoteFailed, message)
+	o.log.Error("submit failed permanently; removing job", "job_id", job.ID, "public_id", job.PublicID, "error", message)
+	_, updateErr := o.store.UpdateJobStateIfCurrent(ctx, job, expectedState, store.StateRemovePending, message)
 	return updateErr
 }
 

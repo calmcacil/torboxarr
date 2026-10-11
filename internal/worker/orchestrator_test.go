@@ -339,9 +339,9 @@ func TestProcessSubmitJob_PermanentFailure(t *testing.T) {
 	if err := orch.Start(startCtx); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, "job fail-001 reaches StateRemoteFailed", 5*time.Second, func() bool {
+	waitFor(t, "job fail-001 is removed", 10*time.Second, func() bool {
 		got, _ := env.store.GetJobByID(ctx, "fail-001")
-		return got != nil && got.State == store.StateRemoteFailed
+		return got != nil && got.State == store.StateRemoved
 	})
 	cancel()
 	orch.Wait()
