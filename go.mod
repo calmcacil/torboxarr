@@ -1,8 +1,7 @@
 module github.com/mrjoiny/torboxarr
 
-go 1.26.0
+go 1.27.1
 
-toolchain go1.26.1
 
 require (
 	github.com/pressly/goose/v3 v3.24.1
