@@ -98,6 +98,19 @@ them as confirmed absence. Successful queue or active matches reset absence
 accounting. Startup also rechecks eligible historical missing-task failures.
 This does not force-start queued jobs or resubmit tasks missing from both views.
 
+### Local Download Recovery
+
+Local transfers time out after two minutes without receiving bytes, including
+stalled response headers or bodies. Progressing transfers have no short API
+request deadline. Partial files are retained for retry, and TorBoxarr requests
+fresh links after HTTP 400/403/404, server errors, or an idle timeout.
+
+Three consecutive status/idle failures without byte progress fail the local
+download; actual progress resets that budget. HTTP 400/404 fails immediately
+only when link lookup succeeds but provides no replacement. A link-refresh
+request failure remains retryable within the same bounded budget. Failed jobs
+remain visible to the client for handling and removal.
+
 ### Connecting Sonarr/Radarr / Download Clients
 
 Set up the *arr download clients after TorBoxarr is running:
