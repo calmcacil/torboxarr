@@ -217,6 +217,7 @@ func (o *Orchestrator) processDownloadJob(ctx context.Context, job *store.Job) e
 			}
 			return nil
 		})
+		resetDownloadStatusRetries(job, lastPartDone, part.BytesDone)
 		if downloadErr != nil {
 			var statusErr *files.HTTPStatusError
 			statusCode := 0
@@ -284,7 +285,8 @@ func (o *Orchestrator) processDownloadJob(ctx context.Context, job *store.Job) e
 				_ = o.store.UpdateJobState(ctx, job, store.StateFailed, msg)
 				return nil
 			}
-			if (is5xx || isLinkError || isIdle) && job.RetryCount >= maxDownloadStatusRetries {
+			if (is5xx || isLinkError || isIdle) && job.RetryCount >= maxDownloadStatusRetries &&
+				(!refreshed || job.RetryCount > maxDownloadStatusRetries) {
 				msg = fmt.Sprintf("download part %s returned HTTP %d %d consecutive times",
 					part.PartKey, statusCode, job.RetryCount)
 				if isIdle {
