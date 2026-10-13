@@ -90,7 +90,7 @@ func (c *HTTPClient) do(ctx context.Context, method, path string, body io.Reader
 		// logical error so callers can distinguish it from a transport-level
 		// failure, but it is still subject to retry/escalation caps.
 		var env apiEnvelope
-		if resp.StatusCode >= 500 && len(bytes.TrimSpace(raw)) > 0 && json.Unmarshal(raw, &env) == nil && !env.Success {
+		if (resp.StatusCode == http.StatusNotFound || resp.StatusCode >= 500) && len(bytes.TrimSpace(raw)) > 0 && json.Unmarshal(raw, &env) == nil && !env.Success {
 			err := classifyEnvelopeError(&env, resp.StatusCode)
 			if IsTorboxLogical(err) {
 				return nil, MarkRetryable(err)
@@ -127,6 +127,9 @@ func classifyEnvelopeError(env *apiEnvelope, status int) error {
 	message := "torbox api returned success=false"
 	if code != "" || env.Detail != "" {
 		message = fmt.Sprintf("torbox api error: %s (%s)", code, env.Detail)
+	}
+	if status == StatusTorboxOriginDown {
+		return MarkRetryable(&HTTPStatusError{StatusCode: status, Message: fmt.Sprintf("torbox status %d: %s", status, message)})
 	}
 	switch code {
 	case "ITEM_NOT_FOUND":

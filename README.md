@@ -106,10 +106,27 @@ request deadline. Partial files are retained for retry, and TorBoxarr requests
 fresh links after HTTP 400/403/404, server errors, or an idle timeout.
 
 Three consecutive status/idle failures without byte progress fail the local
-download; actual progress resets that budget. HTTP 400/404 fails immediately
+download; a newly refreshed link at the limit gets one final transfer attempt.
+Actual progress, including small resumed writes, resets the budget. HTTP 400/404 fails immediately
 only when link lookup succeeds but provides no replacement. A link-refresh
 request failure remains retryable within the same bounded budget. Failed jobs
 remain visible to the client for handling and removal.
+
+### Submission Recovery
+
+HTTP 521 submissions use five persisted attempts, separated by 15 minutes,
+30 minutes, one hour, and three hours. Eligible historical 521 failures are
+rechecked on startup. Exhaustion leaves a failed job visible to the client and
+cleans its local submission artifacts.
+
+Before sending a create request, TorBoxarr persists that its outcome may become
+uncertain. After a timeout, lost response, restart, or other retryable delivery
+failure, it checks applicable queued and active identities before submitting
+again. This applies to ordinary failures as well as HTTP 521. If the outcome
+cannot be resolved, it retains the job and logs pending reconciliation. An
+uncertain submission with no usable tracking identity is not sent again blindly
+and may require manual handling. Proven failures before request delivery can
+retry normally. This does not promise provider-side exactly-once submission.
 
 ### Connecting Sonarr/Radarr / Download Clients
 

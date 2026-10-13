@@ -224,12 +224,25 @@ func (s *Store) UpdateJobStateIfCurrent(ctx context.Context, job *Job, expectedS
 	}
 	if affected != 1 {
 		job.State = previous
-		return false, nil
+		return false, s.mergeRemovalDiscoveries(ctx, job)
 	}
 	if err := s.AppendEvent(ctx, job.ID, &previous, &next, message); err != nil {
 		return false, err
 	}
 	return true, nil
+}
+
+func (s *Store) mergeRemovalDiscoveries(ctx context.Context, job *Job) error {
+	_, err := s.execWrite(ctx, `
+        UPDATE jobs SET remote_id = COALESCE(NULLIF(?, ''), remote_id),
+            queued_id = COALESCE(NULLIF(?, ''), queued_id),
+            queue_auth_id = COALESCE(NULLIF(?, ''), queue_auth_id),
+            remote_hash = COALESCE(NULLIF(?, ''), remote_hash),
+            completed_path = COALESCE(NULLIF(?, ''), completed_path)
+        WHERE id = ? AND state = 'remove_pending'
+    `, nullableString(job.RemoteID), nullableString(job.QueuedID), nullableString(job.QueueAuthID),
+		nullableString(job.RemoteHash), nullableString(job.CompletedPath), job.ID)
+	return err
 }
 
 func (s *Store) updateJob(ctx context.Context, job *Job, where string, whereArgs []any) (int64, error) {
@@ -1059,4 +1072,24 @@ func isSQLiteBusy(err error) bool {
 		strings.Contains(msg, "sqlite_locked") ||
 		strings.Contains(msg, "database is locked") ||
 		strings.Contains(msg, "database table is locked")
+}
+
+func (s *Store) ListRemoteFailed521(ctx context.Context) ([]*Job, error) {
+	rows, err := s.db.QueryContext(ctx, `
+        SELECT `+jobColumns+`
+        FROM jobs
+        WHERE state = 'remote_failed'
+          AND delete_requested = 0
+          AND error_message IS NOT NULL
+          AND (
+              error_message LIKE '%status 521%'
+              OR error_message LIKE '%HTTP 521%'
+          )
+        ORDER BY updated_at ASC
+    `)
+	if err != nil {
+		return nil, fmt.Errorf("list historical 521 failures: %w", err)
+	}
+	defer rows.Close()
+	return scanJobs(rows)
 }

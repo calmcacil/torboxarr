@@ -56,6 +56,9 @@ func (o *Orchestrator) processQueuedPollJob(ctx context.Context, job *store.Job)
 	)
 
 	queuedStatus, queueErr := o.torbox.FindQueuedTask(ctx, string(job.SourceType), deref(job.QueuedID), deref(job.QueueAuthID), deref(job.RemoteHash))
+	if torbox.IsTorboxAbsent(queueErr) {
+		queueErr = nil
+	}
 	if queueErr == nil && queuedStatus != nil {
 		return o.keepQueued(ctx, job, queuedStatus)
 	}
@@ -80,13 +83,17 @@ func (o *Orchestrator) findActive(ctx context.Context, job *store.Job) (*torbox.
 	if remoteID == "" && deref(job.QueuedID) == "" && deref(job.RemoteHash) == "" && deref(job.QueueAuthID) == "" {
 		return nil, fmt.Errorf("no remote identity available for active lookup")
 	}
-	return o.torbox.FindActiveTaskByIdentity(ctx,
+	status, err := o.torbox.FindActiveTaskByIdentity(ctx,
 		string(job.SourceType),
 		remoteID,
 		deref(job.QueuedID),
 		deref(job.QueueAuthID),
 		deref(job.RemoteHash),
 	)
+	if torbox.IsTorboxAbsent(err) {
+		return nil, nil
+	}
+	return status, err
 }
 
 func (o *Orchestrator) reconcileActiveMiss(ctx context.Context, job *store.Job, activeErr error) error {
@@ -94,6 +101,9 @@ func (o *Orchestrator) reconcileActiveMiss(ctx context.Context, job *store.Job, 
 	// queue before treating a missing active item as confirmed absence.
 	if hasQueueTracking(job) {
 		queuedStatus, queueErr := o.torbox.FindQueuedTask(ctx, string(job.SourceType), deref(job.QueuedID), deref(job.QueueAuthID), deref(job.RemoteHash))
+		if torbox.IsTorboxAbsent(queueErr) {
+			queueErr = nil
+		}
 		if queueErr == nil && queuedStatus != nil {
 			return o.restoreQueued(ctx, job, queuedStatus)
 		}

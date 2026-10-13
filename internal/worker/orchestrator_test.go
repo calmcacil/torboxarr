@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -394,6 +395,148 @@ func TestProcessSubmitJob_PermanentFailure(t *testing.T) {
 	})
 	cancel()
 	orch.Wait()
+}
+
+func TestProcessSubmitJob_Torbox521SchedulesBoundedRetry(t *testing.T) {
+	env := newWorkerEnv(t)
+	ctx := context.Background()
+	env.mock.CreateTorrentTaskFn = func(context.Context, torbox.CreateTorrentTaskRequest) (*torbox.CreateTaskResponse, error) {
+		return nil, &torbox.HTTPStatusError{StatusCode: torbox.StatusTorboxOriginDown, Message: "torbox status 521"}
+	}
+
+	job := makeWorkerJob("retry-521-001", "pub-retry-521-001", store.StateSubmitPending, store.SourceTypeTorrent)
+	job.SourceURI = strPtr("magnet:?xt=urn:btih:abc")
+	now := time.Now().UTC()
+	past := now.Add(-time.Minute)
+	job.NextRunAt = &past
+	if err := env.store.CreateJob(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+
+	orch := env.newOrchestrator(t)
+	startCtx, cancel := context.WithCancel(ctx)
+	if err := orch.Start(startCtx); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "job retry-521-001 reaches StateSubmitRetry", 5*time.Second, func() bool {
+		got, _ := env.store.GetJobByID(ctx, job.ID)
+		return got != nil && got.State == store.StateSubmitRetry
+	})
+	cancel()
+	orch.Wait()
+
+	got, err := env.store.GetJobByID(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Metadata.Torbox521Attempts != 1 {
+		t.Fatalf("Torbox521Attempts = %d, want 1", got.Metadata.Torbox521Attempts)
+	}
+	if got.NextRunAt == nil || got.NextRunAt.Before(now.Add(14*time.Minute)) {
+		t.Fatalf("NextRunAt = %v, want at least 14 minutes after processing", got.NextRunAt)
+	}
+	if got.NextRunAt.After(now.Add(16 * time.Minute)) {
+		t.Fatalf("NextRunAt = %v, want about 15 minutes after processing", got.NextRunAt)
+	}
+}
+
+func TestProcessSubmitJob_Torbox521ExhaustionCleansSubmissionArtifacts(t *testing.T) {
+	env := newWorkerEnv(t)
+	ctx := context.Background()
+	env.mock.CreateTorrentTaskFn = func(context.Context, torbox.CreateTorrentTaskRequest) (*torbox.CreateTaskResponse, error) {
+		return nil, &torbox.HTTPStatusError{StatusCode: torbox.StatusTorboxOriginDown, Message: "torbox status 521"}
+	}
+
+	staging := filepath.Join(env.layout.Staging, "retry-521-002")
+	if err := os.MkdirAll(staging, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	payload, _, err := env.layout.SavePayload("retry-521-002", "source.torrent", strings.NewReader("payload"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	job := makeWorkerJob("retry-521-002", "pub-retry-521-002", store.StateSubmitRetry, store.SourceTypeTorrent)
+	job.InfoHash = strPtr("known-torrent-identity")
+	job.SourceURI = strPtr("magnet:?xt=urn:btih:abc")
+	job.StagingPath = &staging
+	job.PayloadRef = &payload
+	job.Metadata.Torbox521Attempts = 4
+	past := time.Now().UTC().Add(-time.Minute)
+	job.NextRunAt = &past
+	if err := env.store.CreateJob(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+
+	orch := env.newOrchestrator(t)
+	startCtx, cancel := context.WithCancel(ctx)
+	if err := orch.Start(startCtx); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "job retry-521-002 reaches StateRemoteFailed", 5*time.Second, func() bool {
+		got, _ := env.store.GetJobByID(ctx, job.ID)
+		return got != nil && got.State == store.StateRemoteFailed
+	})
+	cancel()
+	orch.Wait()
+
+	got, err := env.store.GetJobByID(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Metadata.Torbox521Attempts != 5 {
+		t.Fatalf("Torbox521Attempts = %d, want 5", got.Metadata.Torbox521Attempts)
+	}
+	if got.ErrorMessage == nil || !strings.Contains(*got.ErrorMessage, "HTTP 521") {
+		t.Fatalf("ErrorMessage = %v, want terminal HTTP 521 failure", got.ErrorMessage)
+	}
+	if got.StagingPath != nil || got.PayloadRef != nil {
+		t.Fatalf("submission paths = staging %v, payload %v; want both nil", got.StagingPath, got.PayloadRef)
+	}
+	if _, err := os.Stat(staging); !os.IsNotExist(err) {
+		t.Errorf("staging dir should have been removed, stat error = %v", err)
+	}
+	if _, err := os.Stat(filepath.Dir(payload)); !os.IsNotExist(err) {
+		t.Errorf("payload dir should have been removed, stat error = %v", err)
+	}
+}
+
+func TestProcessSubmitJob_Torbox521ReconcilesQueuedTask(t *testing.T) {
+	env := newWorkerEnv(t)
+	ctx := context.Background()
+	var creates int
+	env.mock.CreateTorrentTaskFn = func(context.Context, torbox.CreateTorrentTaskRequest) (*torbox.CreateTaskResponse, error) {
+		creates++
+		return &torbox.CreateTaskResponse{QueuedID: "unexpected"}, nil
+	}
+	env.mock.FindQueuedTaskFn = func(context.Context, string, string, string, string) (*torbox.TaskStatus, error) {
+		return &torbox.TaskStatus{QueuedID: "queued-521", Hash: "abc"}, nil
+	}
+
+	job := makeWorkerJob("retry-521-003", "pub-retry-521-003", store.StateSubmitRetry, store.SourceTypeTorrent)
+	job.SourceURI = strPtr("magnet:?xt=urn:btih:abc")
+	job.InfoHash = strPtr("abc")
+	job.Metadata.Torbox521Attempts = 1
+	past := time.Now().UTC().Add(-time.Minute)
+	job.NextRunAt = &past
+	if err := env.store.CreateJob(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+
+	orch := env.newOrchestrator(t)
+	startCtx, cancel := context.WithCancel(ctx)
+	if err := orch.Start(startCtx); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "job retry-521-003 reaches StateRemoteQueued", 5*time.Second, func() bool {
+		got, _ := env.store.GetJobByID(ctx, job.ID)
+		return got != nil && got.State == store.StateRemoteQueued
+	})
+	cancel()
+	orch.Wait()
+
+	if creates != 0 {
+		t.Fatalf("create calls = %d, want 0 after queued reconciliation", creates)
+	}
 }
 
 // ─── Remove Job ─────────────────────────────────────────────────────────────

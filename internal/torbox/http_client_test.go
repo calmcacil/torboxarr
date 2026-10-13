@@ -1083,3 +1083,29 @@ func TestFindActiveTaskRejectsHashConflict(t *testing.T) {
 		t.Fatalf("error = %v, want identity conflict", err)
 	}
 }
+
+func TestStructured521KeepsStatusAndRetryability(t *testing.T) {
+	client, _ := newTestHTTPClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(torbox.StatusTorboxOriginDown)
+		_, _ = w.Write([]byte(`{"success":false,"error":"DATABASE_ERROR"}`))
+	})
+	_, err := client.CreateTorrentTask(t.Context(), torbox.CreateTorrentTaskRequest{Magnet: "magnet:?xt=urn:btih:test"})
+	if !torbox.IsHTTPStatus(err, torbox.StatusTorboxOriginDown) || !torbox.IsRetryable(err) {
+		t.Fatalf("error = %v, want retryable HTTP 521", err)
+	}
+}
+
+func Test404WithoutConfirmedAbsenceRemainsInconclusive(t *testing.T) {
+	for _, body := range []string{"Not Found", `{"success":false,"error":"DATABASE_ERROR"}`} {
+		t.Run(body, func(t *testing.T) {
+			client, _ := newTestHTTPClient(t, func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = w.Write([]byte(body))
+			})
+			_, err := client.FindQueuedTask(t.Context(), "torrent", "12", "", "owned")
+			if err == nil || torbox.IsTorboxAbsent(err) || !torbox.IsRetryable(err) {
+				t.Fatalf("error = %v, want retryable inconclusive error", err)
+			}
+		})
+	}
+}

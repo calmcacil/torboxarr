@@ -81,7 +81,9 @@ type SubmissionMetadata struct {
 	QueuedRemoval          UpstreamRemovalProgress `json:"queued_removal,omitempty"`
 	// PollAttempts counts consecutive successful TorBox status checks that
 	// found neither a queued nor an active entry.
-	PollAttempts int `json:"poll_attempts,omitempty"`
+	PollAttempts        int  `json:"poll_attempts,omitempty"`
+	Torbox521Attempts   int  `json:"torbox_521_attempts,omitempty"`
+	SubmissionUncertain bool `json:"submission_uncertain,omitempty"`
 }
 
 type Job struct {
