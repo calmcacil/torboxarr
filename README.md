@@ -64,6 +64,8 @@ Optional overrides:
 | `TORBOXARR_SAB_NZB_KEY` | falls back to `TORBOXARR_SAB_API_KEY` | Explicit key for the SABnzbd-compatible endpoint; omit it to reuse the SAB API key |
 | `TORBOXARR_UPSTREAM_REMOVE` | `false` | Also remove matching active and queued TorBox tasks when the client removes a job |
 
+| `TORBOXARR_REMOTE_ABSENCE_ATTEMPTS` | `5` | Successful checks finding a tracked task absent from both active and queued views before reporting failure |
+
 Docker-specific runtime variables used by the bundled compose file. Set these to the same UID/GID that Sonarr and Radarr use on the host, so TorBoxarr can write to the same download and category folders:
 
 | Variable | Default | What it does |
@@ -86,6 +88,15 @@ cannot be identified safely, local cleanup proceeds and the removed job retains
 a warning for the normal retention period. Logs distinguish complete cleanup
 from `job removed locally; upstream cleanup incomplete`. Upstream tasks can
 remain after an incomplete outcome and may need manual removal.
+
+### Queue Recovery
+
+Accepted TorBox jobs stay pending while TorBox confirms they are queued. A
+queue ID is not treated as an active task ID. TorBoxarr reconciles both views
+across queue-to-active handover and retries lookup failures without counting
+them as confirmed absence. Successful queue or active matches reset absence
+accounting. Startup also rechecks eligible historical missing-task failures.
+This does not force-start queued jobs or resubmit tasks missing from both views.
 
 ### Connecting Sonarr/Radarr / Download Clients
 

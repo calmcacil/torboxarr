@@ -43,6 +43,9 @@ func (m *MockClient) FindQueuedTask(ctx context.Context, sourceType, queuedID, q
 	if m.FindQueuedTaskFn != nil {
 		return m.FindQueuedTaskFn(ctx, sourceType, queuedID, queueAuthID, remoteHash)
 	}
+	if m.GetQueuedStatusFn != nil {
+		return m.GetQueuedStatusFn(ctx, sourceType, queuedID)
+	}
 	// Keep the zero-config mock useful for tests that only care about the
 	// deletion request. Real clients always perform the lookup themselves.
 	if queuedID != "" {
@@ -62,6 +65,9 @@ func (m *MockClient) FindActiveTask(ctx context.Context, sourceType, remoteID, q
 	if m.FindActiveTaskFn != nil {
 		return m.FindActiveTaskFn(ctx, sourceType, remoteID, queueAuthID, remoteHash)
 	}
+	if m.GetTaskStatusFn != nil {
+		return m.GetTaskStatusFn(ctx, sourceType, remoteID)
+	}
 	return m.findActiveTask(remoteID, "", queueAuthID, remoteHash), nil
 }
 
@@ -71,6 +77,9 @@ func (m *MockClient) FindActiveTaskByIdentity(ctx context.Context, sourceType, r
 	}
 	if m.FindActiveTaskFn != nil {
 		return m.FindActiveTaskFn(ctx, sourceType, remoteID, queueAuthID, remoteHash)
+	}
+	if m.GetTaskStatusFn != nil {
+		return m.GetTaskStatusFn(ctx, sourceType, remoteID)
 	}
 	if remoteID != "" {
 		return &TaskStatus{RemoteID: remoteID, QueueAuthID: queueAuthID, Hash: remoteHash}, nil

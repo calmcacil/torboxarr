@@ -79,6 +79,9 @@ type SubmissionMetadata struct {
 	UpstreamDeleteAttempts int                     `json:"upstream_delete_attempts,omitempty"`
 	ActiveRemoval          UpstreamRemovalProgress `json:"active_removal,omitempty"`
 	QueuedRemoval          UpstreamRemovalProgress `json:"queued_removal,omitempty"`
+	// PollAttempts counts consecutive successful TorBox status checks that
+	// found neither a queued nor an active entry.
+	PollAttempts int `json:"poll_attempts,omitempty"`
 }
 
 type Job struct {

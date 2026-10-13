@@ -20,19 +20,15 @@ func parseCreateTask(env *apiEnvelope, asQueued bool) (*CreateTaskResponse, erro
 		activeID := extractActiveID("", object, false)
 		queuedID := firstString(object, "queued_id", "queue_id")
 		if activeID == "" && queuedID == "" {
-			genericID := extractQueuedID(object)
-			if asQueued {
-				queuedID = genericID
-			} else {
-				activeID = genericID
-			}
+			queuedID = extractQueuedID(object)
 		}
 		return &CreateTaskResponse{
-			RemoteID:    activeID,
-			QueuedID:    queuedID,
-			QueueAuthID: extractQueueAuthID("", object),
-			RemoteHash:  firstString(object, "hash"),
-			DisplayName: firstString(object, "name", "filename"),
+			RemoteID:         activeID,
+			ActiveIDExplicit: activeID != "",
+			QueuedID:         queuedID,
+			QueueAuthID:      extractQueueAuthID("", object),
+			RemoteHash:       firstString(object, "hash"),
+			DisplayName:      firstString(object, "name", "filename"),
 		}, nil
 	}
 
@@ -159,7 +155,8 @@ func parseTaskStatus(sourceType string, item map[string]any, active bool) *TaskS
 		Failed:           failed,
 		Inactive:         inactive,
 		Error:            errorText,
-		Files:            files,
+
+		Files: files,
 	}
 }
 
@@ -191,7 +188,7 @@ func extractQueueAuthID(sourceType string, item map[string]any) string {
 	if authID := firstString(item, "auth_id"); authID != "" {
 		return authID
 	}
-	if !strings.EqualFold(sourceType, "usenet") {
+	if normalizeSourceType(sourceType) != "usenet" {
 		return ""
 	}
 	torrentFile := firstString(item, "torrent_file")

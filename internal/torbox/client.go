@@ -40,11 +40,12 @@ type CreateUsenetTaskRequest struct {
 }
 
 type CreateTaskResponse struct {
-	RemoteID    string
-	QueuedID    string
-	QueueAuthID string
-	RemoteHash  string
-	DisplayName string
+	ActiveIDExplicit bool
+	RemoteID         string
+	QueuedID         string
+	QueueAuthID      string
+	RemoteHash       string
+	DisplayName      string
 }
 
 type RemoteFile struct {
