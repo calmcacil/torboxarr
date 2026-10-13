@@ -10,6 +10,10 @@ payloads. This branch adds opt-in upstream removal and the shared lookup and
 worker-state safeguards it requires; manual-add, force-start, HTTP 521 policy,
 toolchain upgrades, and cleanup at download completion are outside its scope.
 
+The [contribution inventory](CONTRIBUTION_SCOPE.md) records which tested dev
+connectivity fixes are included here, which require the separate reliability
+contribution, and which shared safeguards must survive either merge order.
+
 ## Design
 
 ### Removal State Machine
