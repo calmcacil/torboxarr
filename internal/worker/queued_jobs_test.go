@@ -25,7 +25,7 @@ type queuedTestEnv struct {
 func newQueuedTestEnv(t *testing.T) *queuedTestEnv {
 	t.Helper()
 	ctx := context.Background()
-	db, err := store.Open(ctx, ":memory:", 5*time.Second)
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "worker.db"), 5*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}

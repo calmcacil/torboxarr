@@ -63,7 +63,6 @@ Optional overrides:
 | `TORBOXARR_LOG_LEVEL` | `INFO` | Log verbosity: DEBUG, INFO, WARN, or ERROR |
 | `TORBOXARR_SAB_NZB_KEY` | falls back to `TORBOXARR_SAB_API_KEY` | Explicit key for the SABnzbd-compatible endpoint; omit it to reuse the SAB API key |
 | `TORBOXARR_UPSTREAM_REMOVE` | `false` | Also remove matching active and queued TorBox tasks when the client removes a job |
-
 | `TORBOXARR_REMOTE_ABSENCE_ATTEMPTS` | `5` | Successful checks finding a tracked task absent from both active and queued views before reporting failure |
 
 Docker-specific runtime variables used by the bundled compose file. Set these to the same UID/GID that Sonarr and Radarr use on the host, so TorBoxarr can write to the same download and category folders:
